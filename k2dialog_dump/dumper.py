@@ -29,6 +29,15 @@ class DumpedDialogue:
 
 LOGGER = logging.getLogger(__name__)
 OUTPUT_MARKER = ".k2dialog_dump_output"
+ALIGNMENT_SCRIPT_EFFECTS = {
+    "a_darksml": ("Dark Side", 1),
+    "a-darksml": ("Dark Side", 1),
+    "a_darkmed": ("Dark Side", 2),
+    "a_darkhigh": ("Dark Side", 3),
+    "a_lightsml": ("Light Side", 1),
+    "a_lightmed": ("Light Side", 2),
+    "a_lighthigh": ("Light Side", 3),
+}
 
 
 def dump_game(options: DumpOptions) -> list[DumpedDialogue]:
@@ -883,7 +892,10 @@ def _effect_lines(node: GffStruct) -> list[str]:
     for script, params in _action_script_calls(node):
         normalized = script.lower()
         amount = params[0] if params else 0
-        if normalized == "a_givelight":
+        if normalized in ALIGNMENT_SCRIPT_EFFECTS:
+            side, points = ALIGNMENT_SCRIPT_EFFECTS[normalized]
+            effects.append(f"{side} +{points}")
+        elif normalized == "a_givelight":
             effects.append(f"Light Side +{amount or 1}")
         elif normalized == "a_givedark":
             effects.append(f"Dark Side +{amount or 1}")
