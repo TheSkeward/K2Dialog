@@ -606,7 +606,7 @@ def _reply_lines(
         annotations: list[str] = []
         annotations.extend(_link_detail_lines(link))
         visibility_lines = _visibility_check_lines(link, reply_text)
-        prefix_tags: list[str] = []
+        prefix_tags = _visibility_prefix_tags(visibility_lines, choice_text)
         check_lines: list[str] = []
         if reply is not None:
             annotations.extend(_effect_lines(reply))
@@ -822,6 +822,29 @@ def _check_prefix_tags(check_lines: list[str], choice_text: str) -> list[str]:
     return tags
 
 
+def _visibility_prefix_tags(check_lines: list[str], choice_text: str) -> list[str]:
+    tags: list[str] = []
+    for line in check_lines:
+        tag = _visibility_prefix_tag_for_line(line, choice_text)
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def _visibility_prefix_tag_for_line(check_line: str, choice_text: str) -> str:
+    line = check_line.removeprefix("Requires ").strip()
+    match = re.fullmatch(r"(?P<label>.+?) below (?P<dc>\d+)", line)
+    if match and _choice_tag_matches_check(choice_text, match.group("label")):
+        return f"{match.group('label').strip()} below {match.group('dc')}"
+
+    match = re.fullmatch(r"(?P<label>.+?) (?P<dc>\d+)(?: \+ (?P<item>.+))?", line)
+    if match and _choice_tag_matches_check(choice_text, match.group("label")):
+        item = f" + {match.group('item')}" if match.group("item") else ""
+        return f"{match.group('label').strip()} {match.group('dc')}{item}"
+
+    return ""
+
+
 def _check_prefix_tags_for_line(check_line: str, choice_text: str) -> list[str]:
     line = check_line.removeprefix("Requires ").strip()
     if line.startswith(("success:", "failure:", "otherwise:")):
@@ -859,7 +882,7 @@ def _check_prefix_tags_for_line(check_line: str, choice_text: str) -> list[str]:
 def _labeled_check_tags(label: str, dc_tag: str, choice_text: str) -> list[str]:
     if _choice_tag_matches_check(choice_text, label):
         return [dc_tag]
-    return [label.strip(), dc_tag]
+    return [f"{label.strip()} {dc_tag}"]
 
 
 def _choice_tag_matches_check(choice_text: str, check_label: str) -> bool:
@@ -1884,18 +1907,27 @@ def _insert_choice_prefix_tags(text: str, prefix_tags: list[str]) -> str:
 
     stripped = text.strip()
     position = 0
+    existing_tags: list[str] = []
     while True:
-        match = re.match(r"\s*\[[^\]]+\]\s*", stripped[position:])
+        match = re.match(r"\s*\[([^\]]+)\]\s*", stripped[position:])
         if not match:
             break
+        existing_tags.append(match.group(1).strip())
         position += match.end()
 
-    prefix = stripped[:position].rstrip()
+    kept_existing_tags = [
+        tag for tag in existing_tags if not any(_prefix_replaces_existing_tag(tag, prefix) for prefix in prefix_tags)
+    ]
     rest = stripped[position:].lstrip()
-    inserted = " ".join(f"[{tag}]" for tag in prefix_tags)
-    if prefix:
-        return f"{prefix} {inserted} {rest}".strip()
+    inserted_tags = kept_existing_tags + prefix_tags
+    inserted = " ".join(f"[{tag}]" for tag in inserted_tags)
     return f"{inserted} {rest}".strip()
+
+
+def _prefix_replaces_existing_tag(existing_tag: str, prefix_tag: str) -> bool:
+    existing = _normalize_check_label(existing_tag)
+    prefix = _normalize_check_label(prefix_tag)
+    return bool(existing and existing != prefix and prefix.startswith(existing))
 
 
 def _replace_cost_tokens(text: str) -> str:
