@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "k2dialog-dump"
+version = "0.1.0"
+description = "Dump resolved KOTOR II dialogue trees to searchable Markdown."
+requires-python = ">=3.10"
+readme = "README.md"
+
+[project.scripts]
+k2dialog-dump = "k2dialog_dump.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["k2dialog_dump*"]
