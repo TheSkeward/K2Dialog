@@ -695,14 +695,23 @@ def _reply_check_lines(
 
     gt_checks = [item for item in checks if item[0]["op"] == "gt"]
     lt_checks = [item for item in checks if item[0]["op"] == "lt"]
-    other_checks = [item for item in checks if item[0]["op"] not in {"gt", "lt"}]
+    attr_gt_checks = [item for item in checks if item[0]["op"] == "attr_gt"]
+    other_checks = [item for item in checks if item[0]["op"] not in {"gt", "lt", "attr_gt"}]
 
-    if gt_checks and len(gt_checks) > 1:
-        gt_checks.sort(key=lambda item: int(item[0]["dc"]), reverse=True)
-        for check, entry_index in gt_checks:
-            lines.append(f"DC {check['dc']}: {_entry_outcome(entry_index, entries, tlk)}")
+    success_checks = gt_checks + attr_gt_checks
+    if len(success_checks) > 1:
+        success_checks.sort(key=lambda item: int(item[0]["dc"]), reverse=True)
+        for check, entry_index in success_checks:
+            condition = _outcome_check_condition(check, reply_text)
+            lines.append(f"{condition}: {_entry_outcome(entry_index, entries, tlk)}")
         if fallback_entries:
             lines.append(f"otherwise: {_entry_outcomes(fallback_entries, entries, tlk)}")
+        for check, entry_index in lt_checks:
+            lines.append(f"DC {check['dc']}")
+            lines.append(f"failure: {_entry_outcome(entry_index, entries, tlk)}")
+        for check, entry_index in other_checks:
+            lines.append(_skill_check_label(check))
+            lines.append(f"success: {_entry_outcome(entry_index, entries, tlk)}")
         return lines
 
     for check, entry_index in gt_checks:
@@ -723,6 +732,14 @@ def _reply_check_lines(
         if fallback_entries:
             lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, tlk)}")
     return lines
+
+
+def _outcome_check_condition(check: dict[str, object], reply_text: str) -> str:
+    skill = str(check["skill"])
+    dc = check.get("dc", "")
+    if _choice_tag_matches_check(reply_text, skill):
+        return f"DC {dc}"
+    return f"{skill} DC {dc}"
 
 
 def _visibility_check_lines(link: GffStruct, reply_text: str) -> list[str]:
@@ -750,6 +767,8 @@ def _check_prefix_tags(check_lines: list[str], choice_text: str) -> list[str]:
 def _check_prefix_tags_for_line(check_line: str, choice_text: str) -> list[str]:
     line = check_line.removeprefix("Requires ").strip()
     if line.startswith(("success:", "failure:", "otherwise:")):
+        return []
+    if ":" in line:
         return []
     if re.fullmatch(r"(?:below )?DC \d+(?:-\d+)?", line):
         return [line]
