@@ -224,7 +224,7 @@ def _auto_next_entries(entry: GffStruct, replies: list[GffStruct], tlk: TlkTable
     reply_text, _notes = _split_designer_notes(_resolve_text(reply, tlk))
     if reply_text and reply_text.lower() != "[continue]":
         return []
-    if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], tlk):
+    if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], replies, tlk):
         return []
 
     next_links = _as_list(reply.get("EntriesList"))
@@ -299,7 +299,7 @@ def _auto_next_entry_labels(entry: GffStruct, replies: list[GffStruct], tlk: Tlk
     reply_text, _notes = _split_designer_notes(_resolve_text(reply, tlk))
     if reply_text and reply_text.lower() != "[continue]":
         return []
-    if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], tlk):
+    if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], replies, tlk):
         return []
 
     targets: list[tuple[str, int]] = []
@@ -602,11 +602,11 @@ def _reply_lines(
         check_lines: list[str] = []
         if reply is not None:
             annotations.extend(_effect_lines(reply))
-            check_lines = _reply_check_lines(reply, reply_text, entries, tlk)
+            check_lines = _reply_check_lines(reply, reply_text, entries, replies, tlk)
             prefix_tags.extend(_check_prefix_tags(check_lines, choice_text))
             annotations.extend(line for line in check_lines if not _check_prefix_tags_for_line(line, choice_text))
             if not check_lines:
-                annotations.extend(_immediate_entry_effect_lines(reply, entries))
+                annotations.extend(_routed_entry_effect_lines(reply, entries, replies, tlk))
         elif show_unresolved_checks and _tag_without_check_line(reply_text, link, reply):
             annotations.append(_tag_without_check_line(reply_text, link, reply))
         if show_unresolved_checks and reply is not None and not check_lines and not visibility_lines:
@@ -620,13 +620,61 @@ def _reply_lines(
     return reply_lines
 
 
-def _immediate_entry_effect_lines(reply: GffStruct, entries: list[GffStruct]) -> list[str]:
+def _routed_entry_effect_lines(
+    reply: GffStruct,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+) -> list[str]:
     effects: list[str] = []
     for entry_link in _as_list(reply.get("EntriesList")):
         entry_index = _index_from_link(entry_link)
         if entry_index is None or not (0 <= entry_index < len(entries)):
             continue
-        effects.extend(_effect_lines(entries[entry_index]))
+        effects.extend(_automatic_route_effect_lines(entry_index, entries, replies, tlk))
+    return list(dict.fromkeys(effects))
+
+
+def _automatic_route_effect_lines(
+    start_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+) -> list[str]:
+    effects: list[str] = []
+    seen: set[int] = set()
+    current = start_index
+    while 0 <= current < len(entries) and current not in seen:
+        seen.add(current)
+        entry = entries[current]
+        effects.extend(_effect_lines(entry))
+
+        links = _as_list(entry.get("RepliesList"))
+        if len(links) != 1:
+            break
+        link = links[0]
+        if _link_detail_lines(link) or _visibility_check_lines(link, ""):
+            break
+
+        reply_index = _index_from_link(link)
+        if reply_index is None or not (0 <= reply_index < len(replies)):
+            break
+        reply = replies[reply_index]
+        reply_text, notes = _split_designer_notes(_resolve_text(reply, tlk))
+        if notes or (reply_text and reply_text.lower() != "[continue]"):
+            break
+
+        effects.extend(_effect_lines(reply))
+        if _reply_check_lines(reply, reply_text, entries, replies, tlk):
+            break
+
+        next_links = _as_list(reply.get("EntriesList"))
+        if len(next_links) != 1 or _link_detail_lines(next_links[0]):
+            break
+        next_index = _index_from_link(next_links[0])
+        if next_index is None:
+            break
+        current = next_index
     return list(dict.fromkeys(effects))
 
 
@@ -672,6 +720,7 @@ def _reply_check_lines(
     reply: GffStruct,
     reply_text: str,
     entries: list[GffStruct],
+    replies: list[GffStruct],
     tlk: TlkTable,
 ) -> list[str]:
     checks: list[tuple[dict[str, object], int]] = []
@@ -703,34 +752,34 @@ def _reply_check_lines(
         success_checks.sort(key=lambda item: int(item[0]["dc"]), reverse=True)
         for check, entry_index in success_checks:
             condition = _outcome_check_condition(check, reply_text)
-            lines.append(f"{condition}: {_entry_outcome(entry_index, entries, tlk)}")
+            lines.append(f"{condition}: {_entry_outcome(entry_index, entries, replies, tlk)}")
         if fallback_entries:
-            lines.append(f"otherwise: {_entry_outcomes(fallback_entries, entries, tlk)}")
+            lines.append(f"otherwise: {_entry_outcomes(fallback_entries, entries, replies, tlk)}")
         for check, entry_index in lt_checks:
             lines.append(f"DC {check['dc']}")
-            lines.append(f"failure: {_entry_outcome(entry_index, entries, tlk)}")
+            lines.append(f"failure: {_entry_outcome(entry_index, entries, replies, tlk)}")
         for check, entry_index in other_checks:
             lines.append(_skill_check_label(check))
-            lines.append(f"success: {_entry_outcome(entry_index, entries, tlk)}")
+            lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk)}")
         return lines
 
     for check, entry_index in gt_checks:
         lines.append(f"DC {check['dc']}")
-        lines.append(f"success: {_entry_outcome(entry_index, entries, tlk)}")
+        lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk)}")
         if fallback_entries:
-            lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, tlk)}")
+            lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, replies, tlk)}")
 
     for check, entry_index in lt_checks:
         lines.append(f"DC {check['dc']}")
         if fallback_entries:
-            lines.append(f"success: {_entry_outcomes(fallback_entries, entries, tlk)}")
-        lines.append(f"failure: {_entry_outcome(entry_index, entries, tlk)}")
+            lines.append(f"success: {_entry_outcomes(fallback_entries, entries, replies, tlk)}")
+        lines.append(f"failure: {_entry_outcome(entry_index, entries, replies, tlk)}")
 
     for check, entry_index in other_checks:
         lines.append(_skill_check_label(check))
-        lines.append(f"success: {_entry_outcome(entry_index, entries, tlk)}")
+        lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk)}")
         if fallback_entries:
-            lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, tlk)}")
+            lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, replies, tlk)}")
     return lines
 
 
@@ -885,19 +934,34 @@ def _companion_label(companion_id: int) -> str:
     return names.get(companion_id, f"Companion {companion_id}")
 
 
-def _entry_outcomes(indices: list[int], entries: list[GffStruct], tlk: TlkTable) -> str:
-    return ", ".join(_entry_outcome(index, entries, tlk) for index in indices)
+def _entry_outcomes(
+    indices: list[int],
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+) -> str:
+    return ", ".join(_entry_outcome(index, entries, replies, tlk) for index in indices)
 
 
-def _entry_outcome(index: int, entries: list[GffStruct], tlk: TlkTable) -> str:
+def _entry_outcome(
+    index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+) -> str:
     summary = ""
     if 0 <= index < len(entries):
-        summary = _outcome_summary(entries[index], tlk)
+        summary = _outcome_summary(index, entries, replies, tlk)
     return summary or f"Entry {index}"
 
 
-def _outcome_summary(entry: GffStruct, tlk: TlkTable) -> str:
-    effects = _effect_lines(entry)
+def _outcome_summary(
+    index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+) -> str:
+    effects = _automatic_route_effect_lines(index, entries, replies, tlk)
     if effects:
         return ", ".join(effects)
     return ""
@@ -1270,7 +1334,7 @@ def _is_trivial_end_continue(link: GffStruct, replies: list[GffStruct], tlk: Tlk
         return False
     if reply_text and reply_text.lower() != "[continue]":
         return False
-    if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], tlk):
+    if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], replies, tlk):
         return False
     return not _as_list(reply.get("EntriesList"))
 
@@ -1288,7 +1352,7 @@ def _is_trivial_continue_reply(link: GffStruct, replies: list[GffStruct], tlk: T
         return False
     if reply_text and reply_text.lower() != "[continue]":
         return False
-    if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], tlk):
+    if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], replies, tlk):
         return False
     return True
 
