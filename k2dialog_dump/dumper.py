@@ -606,8 +606,7 @@ def _reply_lines(
         annotations: list[str] = []
         annotations.extend(_link_detail_lines(link))
         visibility_lines = _visibility_check_lines(link, reply_text)
-        prefix_tags = _check_prefix_tags(visibility_lines, choice_text)
-        annotations.extend(line for line in visibility_lines if not _check_prefix_tags_for_line(line, choice_text))
+        prefix_tags: list[str] = []
         check_lines: list[str] = []
         if reply is not None:
             annotations.extend(_effect_lines(reply))
@@ -773,13 +772,13 @@ def _reply_check_lines(
         return lines
 
     for check, entry_index in gt_checks:
-        lines.append(f"DC {check['dc']}")
+        lines.append(_outcome_check_condition(check, reply_text))
         lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk)}")
         if fallback_entries:
             lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, replies, tlk)}")
 
     for check, entry_index in lt_checks:
-        lines.append(f"DC {check['dc']}")
+        lines.append(_outcome_check_condition(check, reply_text))
         if fallback_entries:
             lines.append(f"success: {_entry_outcomes(fallback_entries, entries, replies, tlk)}")
         lines.append(f"failure: {_entry_outcome(entry_index, entries, replies, tlk)}")
@@ -795,9 +794,10 @@ def _reply_check_lines(
 def _outcome_check_condition(check: dict[str, object], reply_text: str) -> str:
     skill = str(check["skill"])
     dc = check.get("dc", "")
+    prefix = "below DC" if check.get("op") == "lt" else "DC"
     if _choice_tag_matches_check(reply_text, skill):
-        return f"DC {dc}"
-    return f"{skill} DC {dc}"
+        return f"{prefix} {dc}"
+    return f"{skill} {prefix} {dc}"
 
 
 def _visibility_check_lines(link: GffStruct, reply_text: str) -> list[str]:
