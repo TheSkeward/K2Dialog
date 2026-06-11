@@ -605,6 +605,8 @@ def _reply_lines(
             check_lines = _reply_check_lines(reply, reply_text, entries, tlk)
             prefix_tags.extend(_check_prefix_tags(check_lines, choice_text))
             annotations.extend(line for line in check_lines if not _check_prefix_tags_for_line(line, choice_text))
+            if not check_lines:
+                annotations.extend(_immediate_entry_effect_lines(reply, entries))
         elif show_unresolved_checks and _tag_without_check_line(reply_text, link, reply):
             annotations.append(_tag_without_check_line(reply_text, link, reply))
         if show_unresolved_checks and reply is not None and not check_lines and not visibility_lines:
@@ -616,6 +618,16 @@ def _reply_lines(
         suffix = _choice_text(choice_text, prefix_tags)
         reply_lines.append(f"- {suffix}{detail}")
     return reply_lines
+
+
+def _immediate_entry_effect_lines(reply: GffStruct, entries: list[GffStruct]) -> list[str]:
+    effects: list[str] = []
+    for entry_link in _as_list(reply.get("EntriesList")):
+        entry_index = _index_from_link(entry_link)
+        if entry_index is None or not (0 <= entry_index < len(entries)):
+            continue
+        effects.extend(_effect_lines(entries[entry_index]))
+    return list(dict.fromkeys(effects))
 
 
 def _resolve_text(node: GffStruct, tlk: TlkTable) -> str:
