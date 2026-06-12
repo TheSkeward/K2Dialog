@@ -99,6 +99,25 @@ def render_dialogue(
             continue
         if _is_empty_transition_entry(entry, replies, tlk):
             continue
+        forced_path = _forced_reply_transcript_path_to_choices(index, entries, replies, tlk, speaker_hint)
+        if forced_path:
+            block = _render_forced_reply_transcript_path(
+                forced_path,
+                entries,
+                replies,
+                tlk,
+                speaker_hint,
+                show_unresolved_checks=show_unresolved_checks,
+            )
+            if _block_seen(block, seen_blocks):
+                skip_entries.update(forced_path[0])
+                continue
+            lines.extend(block)
+            skip_entries.update(forced_path[0])
+            lines.append("---")
+            lines.append("")
+            rendered_any = True
+            continue
         chain = _linear_continue_chain(index, entries, replies, tlk, speaker_hint)
         if len(chain) >= 2:
             last_entry = entries[chain[-1]]
@@ -349,6 +368,76 @@ def _auto_transcript_paths_from(
     return deduped
 
 
+def _forced_reply_transcript_path_to_choices(
+    start_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    speaker_hint: str,
+) -> tuple[list[int], list[tuple[str, str]], int] | None:
+    entry_indices: list[int] = []
+    turns: list[tuple[str, str]] = []
+    seen_entries: set[int] = set()
+    forced_reply_count = 0
+    current = start_index
+
+    while 0 <= current < len(entries) and current not in seen_entries:
+        seen_entries.add(current)
+        entry_indices.append(current)
+        entry = entries[current]
+        _append_entry_turn(turns, entry, tlk, speaker_hint)
+
+        hidden_next = _trivial_continue_next(entry, replies, tlk)
+        if hidden_next is not None:
+            current = hidden_next
+            continue
+
+        reply_lines = _reply_lines(entry, entries, replies, tlk)
+        if len(reply_lines) > 1:
+            if forced_reply_count:
+                return entry_indices, turns, current
+            return None
+        if len(reply_lines) != 1:
+            return None
+
+        links = _as_list(entry.get("RepliesList"))
+        if len(links) != 1:
+            return None
+        link = links[0]
+        reply_index = _index_from_link(link)
+        if reply_index is None or not (0 <= reply_index < len(replies)):
+            return None
+        reply = replies[reply_index]
+        reply_text, _reply_notes = _split_designer_notes(_resolve_text(reply, tlk))
+        if _reply_check_lines(reply, reply_text, entries, replies, tlk):
+            return None
+
+        next_links = _as_list(reply.get("EntriesList"))
+        if len(next_links) != 1:
+            return None
+        next_link = next_links[0]
+        if _link_detail_lines(next_link):
+            return None
+        next_index = _index_from_link(next_link)
+        if next_index is None:
+            return None
+
+        turn_text = _reply_line_text(link, entries, replies, tlk)
+        if not turn_text:
+            return None
+        turns.append(("Exile", turn_text))
+        forced_reply_count += 1
+        current = next_index
+
+    return None
+
+
+def _append_entry_turn(turns: list[tuple[str, str]], entry: GffStruct, tlk: TlkTable, speaker_hint: str) -> None:
+    text, _entry_notes = _split_designer_notes(_resolve_text(entry, tlk))
+    if text:
+        turns.append((_entry_speaker(entry, speaker_hint), text))
+
+
 def _auto_choice_targets(
     entry: GffStruct,
     entries: list[GffStruct],
@@ -484,6 +573,37 @@ def _render_transcript_chain_with_choices(
     lines = _render_transcript_chain(chain, entries, tlk, speaker_hint)
     reply_lines = _reply_lines(
         entries[chain[-1]],
+        entries,
+        replies,
+        tlk,
+        show_unresolved_checks=show_unresolved_checks,
+    )
+    if reply_lines:
+        lines.append("")
+        lines.extend(reply_lines)
+    return lines
+
+
+def _render_forced_reply_transcript_path(
+    path: tuple[list[int], list[tuple[str, str]], int],
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    speaker_hint: str,
+    *,
+    show_unresolved_checks: bool = False,
+) -> list[str]:
+    entry_indices, turns, final_entry_index = path
+    lines = [_entry_chain_heading(entry_indices), ""]
+    for speaker, parts in _merge_turns([(speaker, [text]) for speaker, text in turns]):
+        text = _paragraph(" ".join(parts))
+        if speaker:
+            lines.append(f"**{_md_escape(speaker)}:** {text}")
+        else:
+            lines.append(text)
+
+    reply_lines = _reply_lines(
+        entries[final_entry_index],
         entries,
         replies,
         tlk,
@@ -767,41 +887,61 @@ def _reply_lines(
 
     reply_lines: list[str] = []
     for link in linked_replies:
-        reply_index = _index_from_link(link)
-        if reply_index is None:
-            continue
-        reply_text = ""
-        reply: GffStruct | None = None
-        if 0 <= reply_index < len(replies):
-            reply = replies[reply_index]
-            reply_text, _reply_notes = _split_designer_notes(_resolve_text(reply, tlk))
-        force_tag = _force_persuade_choice_tag(link, reply)
-        if not force_tag and _leading_tag(reply_text).lower() == "force persuade":
-            force_tag = "Affect Mind"
-        choice_text = _add_force_persuade_tag(reply_text, force_tag) if reply_text else "[continue]"
-        annotations: list[str] = []
-        annotations.extend(_link_detail_lines(link))
-        visibility_lines = _visibility_check_lines(link, reply_text)
-        prefix_tags = _visibility_prefix_tags(visibility_lines, choice_text)
-        check_lines: list[str] = []
-        if reply is not None:
-            annotations.extend(_effect_lines(reply))
-            check_lines = _reply_check_lines(reply, reply_text, entries, replies, tlk)
-            prefix_tags.extend(_check_prefix_tags(check_lines, choice_text))
-            annotations.extend(line for line in check_lines if not _check_prefix_tags_for_line(line, choice_text))
-            if not check_lines:
-                annotations.extend(_routed_entry_effect_lines(reply, entries, replies, tlk))
-        elif show_unresolved_checks and _tag_without_check_line(reply_text, link, reply):
-            annotations.append(_tag_without_check_line(reply_text, link, reply))
-        if show_unresolved_checks and reply is not None and not check_lines and not visibility_lines:
-            tag_line = _tag_without_check_line(reply_text, link, reply)
-            if tag_line:
-                annotations.append(tag_line)
-        annotations = list(dict.fromkeys(annotations))
-        detail = f" [{'; '.join(annotations)}]" if annotations else ""
-        suffix = _choice_text(choice_text, prefix_tags)
-        reply_lines.append(f"- {suffix}{detail}")
+        line = _reply_line_text(
+            link,
+            entries,
+            replies,
+            tlk,
+            show_unresolved_checks=show_unresolved_checks,
+        )
+        if line:
+            reply_lines.append(f"- {line}")
     return reply_lines
+
+
+def _reply_line_text(
+    link: GffStruct,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    *,
+    show_unresolved_checks: bool = False,
+) -> str:
+    reply_index = _index_from_link(link)
+    if reply_index is None:
+        return ""
+
+    reply_text = ""
+    reply: GffStruct | None = None
+    if 0 <= reply_index < len(replies):
+        reply = replies[reply_index]
+        reply_text, _reply_notes = _split_designer_notes(_resolve_text(reply, tlk))
+    force_tag = _force_persuade_choice_tag(link, reply)
+    if not force_tag and _leading_tag(reply_text).lower() == "force persuade":
+        force_tag = "Affect Mind"
+    choice_text = _add_force_persuade_tag(reply_text, force_tag) if reply_text else "[continue]"
+    annotations: list[str] = []
+    annotations.extend(_link_detail_lines(link))
+    visibility_lines = _visibility_check_lines(link, reply_text)
+    prefix_tags = _visibility_prefix_tags(visibility_lines, choice_text)
+    check_lines: list[str] = []
+    if reply is not None:
+        annotations.extend(_effect_lines(reply))
+        check_lines = _reply_check_lines(reply, reply_text, entries, replies, tlk)
+        prefix_tags.extend(_check_prefix_tags(check_lines, choice_text))
+        annotations.extend(line for line in check_lines if not _check_prefix_tags_for_line(line, choice_text))
+        if not check_lines:
+            annotations.extend(_routed_entry_effect_lines(reply, entries, replies, tlk))
+    elif show_unresolved_checks and _tag_without_check_line(reply_text, link, reply):
+        annotations.append(_tag_without_check_line(reply_text, link, reply))
+    if show_unresolved_checks and reply is not None and not check_lines and not visibility_lines:
+        tag_line = _tag_without_check_line(reply_text, link, reply)
+        if tag_line:
+            annotations.append(tag_line)
+    annotations = list(dict.fromkeys(annotations))
+    detail = f" [{'; '.join(annotations)}]" if annotations else ""
+    suffix = _choice_text(choice_text, prefix_tags)
+    return f"{suffix}{detail}"
 
 
 def _routed_entry_effect_lines(
