@@ -157,22 +157,33 @@ def render_dialogue(
                 rendered_any = True
                 continue
         if _is_orphan_entry(entry, entries, replies, tlk):
-            routed_chain = _auto_transcript_path_to_choices(index, entries, replies, tlk)
-            if not routed_chain:
+            routed_paths = _auto_transcript_paths_to_choices(index, entries, replies, tlk)
+            if not routed_paths:
                 continue
-            block = _render_transcript_chain_with_choices(
-                routed_chain,
-                entries,
-                replies,
-                tlk,
-                speaker_hint,
-                show_unresolved_checks=show_unresolved_checks,
-            )
+            if len(routed_paths) == 1:
+                block = _render_transcript_chain_with_choices(
+                    routed_paths[0][1],
+                    entries,
+                    replies,
+                    tlk,
+                    speaker_hint,
+                    show_unresolved_checks=show_unresolved_checks,
+                )
+            else:
+                block = _render_transcript_paths_with_choices(
+                    routed_paths,
+                    entries,
+                    replies,
+                    tlk,
+                    speaker_hint,
+                    show_unresolved_checks=show_unresolved_checks,
+                )
             if _block_seen(block, seen_blocks):
                 skip_entries.add(index)
                 continue
             lines.extend(block)
-            skip_entries.update(routed_chain)
+            for _label, path in routed_paths:
+                skip_entries.update(path)
             lines.append("---")
             lines.append("")
             rendered_any = True
@@ -287,29 +298,55 @@ def _auto_route_reaches_meaningful_replies(
     return False
 
 
-def _auto_transcript_path_to_choices(
+def _auto_transcript_paths_to_choices(
     start_index: int,
     entries: list[GffStruct],
     replies: list[GffStruct],
     tlk: TlkTable,
-) -> list[int]:
-    path: list[int] = []
-    seen: set[int] = set()
-    current = start_index
+) -> list[tuple[str, list[int]]]:
+    return _auto_transcript_paths_from(start_index, "", [], set(), entries, replies, tlk)
 
-    while 0 <= current < len(entries) and current not in seen:
-        seen.add(current)
-        path.append(current)
-        candidate = entries[current]
-        if _entry_has_meaningful_replies(candidate, entries, replies, tlk):
-            return path
 
-        next_entries = _auto_next_entries(candidate, replies, tlk)
-        if len(next_entries) != 1:
-            return []
-        current = next_entries[0]
+def _auto_transcript_paths_from(
+    entry_index: int,
+    label: str,
+    path: list[int],
+    seen: set[int],
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+) -> list[tuple[str, list[int]]]:
+    if entry_index in seen or not (0 <= entry_index < len(entries)):
+        return []
 
-    return []
+    next_path = path + [entry_index]
+    candidate = entries[entry_index]
+    if _entry_has_meaningful_replies(candidate, entries, replies, tlk):
+        return [(label, next_path)]
+
+    results: list[tuple[str, list[int]]] = []
+    for child_label, child_index in _auto_next_entry_labels(candidate, replies, tlk):
+        results.extend(
+            _auto_transcript_paths_from(
+                child_index,
+                _condition_label_join(label, child_label),
+                next_path,
+                seen | {entry_index},
+                entries,
+                replies,
+                tlk,
+            )
+        )
+
+    deduped: list[tuple[str, list[int]]] = []
+    seen_paths: set[tuple[str, tuple[int, ...]]] = set()
+    for branch_label, branch_path in results:
+        key = (branch_label, tuple(branch_path))
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        deduped.append((branch_label, branch_path))
+    return deduped
 
 
 def _auto_choice_targets(
@@ -353,14 +390,29 @@ def _auto_next_entry_labels(entry: GffStruct, replies: list[GffStruct], tlk: Tlk
     if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], replies, tlk):
         return []
 
+    next_links = _as_list(reply.get("EntriesList"))
+    sibling_scripts = {_plain_text(next_link.get("Active")).lower() for next_link in next_links}
+
     targets: list[tuple[str, int]] = []
-    for next_link in _as_list(reply.get("EntriesList")):
+    for next_link in next_links:
         if _link_detail_lines(next_link):
             continue
         next_index = _index_from_link(next_link)
         if next_index is not None:
-            targets.append((_condition_label(_plain_text(next_link.get("Active"))), next_index))
+            targets.append((_auto_link_condition_label(next_link, sibling_scripts), next_index))
     return targets
+
+
+def _auto_link_condition_label(link: GffStruct, sibling_scripts: set[str]) -> str:
+    script = _plain_text(link.get("Active")).lower()
+    label = _condition_label(script)
+    if label or script:
+        return label
+    if "c_ismale" in sibling_scripts:
+        return "female Exile"
+    if "c_isfemale" in sibling_scripts:
+        return "male Exile"
+    return ""
 
 
 def _inherit_label(parent: str, child: str, index: int) -> tuple[str, int]:
@@ -443,6 +495,62 @@ def _render_transcript_chain_with_choices(
     return lines
 
 
+def _render_transcript_paths_with_choices(
+    paths: list[tuple[str, list[int]]],
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    speaker_hint: str,
+    *,
+    show_unresolved_checks: bool = False,
+) -> list[str]:
+    heading_indices = _combined_path_indices(paths)
+    common_path = _common_path_prefix([path for _label, path in paths])
+    common_turns = _chain_turns(common_path, entries, tlk, speaker_hint)
+    lines = [_entry_chain_heading(heading_indices), ""]
+
+    rendered_variants: list[tuple[str, list[str]]] = []
+    seen_variants: dict[str, int] = {}
+    for label, path in paths:
+        variant_path = path[len(common_path) :]
+        variant_lines: list[str] = []
+        for speaker, parts in _merge_turns(common_turns + _chain_turns(variant_path, entries, tlk, speaker_hint)):
+            text = _paragraph(" ".join(parts))
+            if speaker:
+                variant_lines.append(f"**{_md_escape(speaker)}:** {text}")
+            else:
+                variant_lines.append(text)
+
+        reply_lines = _reply_lines(
+            entries[path[-1]],
+            entries,
+            replies,
+            tlk,
+            show_unresolved_checks=show_unresolved_checks,
+        )
+        if reply_lines:
+            variant_lines.append("")
+            variant_lines.extend(reply_lines)
+
+        fingerprint = _block_fingerprint(variant_lines)
+        if fingerprint in seen_variants:
+            existing_index = seen_variants[fingerprint]
+            existing_label, existing_lines = rendered_variants[existing_index]
+            rendered_variants[existing_index] = (_combine_variant_labels(existing_label, label), existing_lines)
+            continue
+        seen_variants[fingerprint] = len(rendered_variants)
+        rendered_variants.append((label, variant_lines))
+
+    show_variant_headings = len(rendered_variants) > 1 or any(label for label, _variant_lines in rendered_variants)
+    for label, variant_lines in rendered_variants:
+        if show_variant_headings:
+            heading = f" ({label})" if label else ""
+            lines.append(f"Variant{heading}:")
+        lines.extend(variant_lines)
+        lines.append("")
+    return lines
+
+
 def _render_transcript_chain_with_branches(
     chain: list[int],
     branch_targets: list[tuple[str, int]],
@@ -510,6 +618,32 @@ def _entry_chain_heading(indices: list[int]) -> str:
         return f"## Entries {sorted_unique[0]}-{sorted_unique[-1]}"
 
     return f"## Entries {_compact_entry_path(ordered_unique)}"
+
+
+def _combined_path_indices(paths: list[tuple[str, list[int]]]) -> list[int]:
+    indices: list[int] = []
+    for _label, path in paths:
+        for index in path:
+            if index not in indices:
+                indices.append(index)
+    return indices
+
+
+def _common_path_prefix(paths: list[list[int]]) -> list[int]:
+    if not paths:
+        return []
+
+    prefix = list(paths[0])
+    for path in paths[1:]:
+        shared_length = 0
+        for left, right in zip(prefix, path):
+            if left != right:
+                break
+            shared_length += 1
+        prefix = prefix[:shared_length]
+        if not prefix:
+            break
+    return prefix
 
 
 def _compact_entry_path(indices: list[int]) -> str:
