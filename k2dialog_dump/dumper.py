@@ -146,11 +146,18 @@ def render_dialogue(
                 continue
             transcript_chain = chain
             if transcript_chain:
-                branch_targets = _auto_choice_targets(last_entry, entries, replies, tlk)
-                if branch_targets:
-                    block = _render_transcript_chain_with_branches(
-                        transcript_chain,
-                        branch_targets,
+                branch_paths = _auto_transcript_paths_from(
+                    chain[-1],
+                    "",
+                    chain[:-1],
+                    set(chain[:-1]),
+                    entries,
+                    replies,
+                    tlk,
+                )
+                if branch_paths:
+                    block = _render_transcript_paths_with_choices(
+                        branch_paths,
                         entries,
                         replies,
                         tlk,
@@ -159,11 +166,13 @@ def render_dialogue(
                     )
                     if _block_seen(block, seen_blocks):
                         skip_entries.update(transcript_chain)
-                        skip_entries.update(target for _label, target in branch_targets)
+                        for _label, path in branch_paths:
+                            skip_entries.update(path)
                         continue
                     lines.extend(block)
                     skip_entries.update(transcript_chain)
-                    skip_entries.update(target for _label, target in branch_targets)
+                    for _label, path in branch_paths:
+                        skip_entries.update(path)
                 else:
                     block = _render_transcript_chain(transcript_chain, entries, tlk, speaker_hint)
                     if _block_seen(block, seen_blocks):
@@ -438,28 +447,6 @@ def _append_entry_turn(turns: list[tuple[str, str]], entry: GffStruct, tlk: TlkT
         turns.append((_entry_speaker(entry, speaker_hint), text))
 
 
-def _auto_choice_targets(
-    entry: GffStruct,
-    entries: list[GffStruct],
-    replies: list[GffStruct],
-    tlk: TlkTable,
-) -> list[tuple[str, int]]:
-    queue: list[tuple[str, int]] = _auto_next_entry_labels(entry, replies, tlk)
-    seen: set[int] = set()
-    targets: list[tuple[str, int]] = []
-    while queue:
-        label, entry_index = queue.pop(0)
-        if entry_index in seen or not (0 <= entry_index < len(entries)):
-            continue
-        seen.add(entry_index)
-        candidate = entries[entry_index]
-        if _entry_has_meaningful_replies(candidate, entries, replies, tlk):
-            targets.append((label, entry_index))
-            continue
-        queue.extend(_inherit_label(label, child_label, child_index) for child_label, child_index in _auto_next_entry_labels(candidate, replies, tlk))
-    return targets
-
-
 def _auto_next_entry_labels(entry: GffStruct, replies: list[GffStruct], tlk: TlkTable) -> list[tuple[str, int]]:
     links = _as_list(entry.get("RepliesList"))
     if len(links) != 1:
@@ -501,11 +488,9 @@ def _auto_link_condition_label(link: GffStruct, sibling_scripts: set[str]) -> st
         return "female Exile"
     if "c_isfemale" in sibling_scripts:
         return "male Exile"
+    if "c_con_attonpm" in sibling_scripts:
+        return "Atton absent"
     return ""
-
-
-def _inherit_label(parent: str, child: str, index: int) -> tuple[str, int]:
-    return _condition_label_join(parent, child), index
 
 
 def _combine_variant_labels(first: str, second: str) -> str:
@@ -525,6 +510,7 @@ def _condition_label(script: str) -> str:
     labels = {
         "c_isfemale": "female Exile",
         "c_ismale": "male Exile",
+        "c_con_attonpm": "Atton present",
     }
     return labels.get(script.lower(), "")
 
@@ -652,60 +638,6 @@ def _render_transcript_paths_with_choices(
             variant_lines.append("")
             variant_lines.extend(reply_lines)
 
-        fingerprint = _block_fingerprint(variant_lines)
-        if fingerprint in seen_variants:
-            existing_index = seen_variants[fingerprint]
-            existing_label, existing_lines = rendered_variants[existing_index]
-            rendered_variants[existing_index] = (_combine_variant_labels(existing_label, label), existing_lines)
-            continue
-        seen_variants[fingerprint] = len(rendered_variants)
-        rendered_variants.append((label, variant_lines))
-
-    show_variant_headings = len(rendered_variants) > 1 or any(label for label, _variant_lines in rendered_variants)
-    for label, variant_lines in rendered_variants:
-        if show_variant_headings:
-            heading = f" ({label})" if label else ""
-            lines.append(f"Variant{heading}:")
-        lines.extend(variant_lines)
-        lines.append("")
-    return lines
-
-
-def _render_transcript_chain_with_branches(
-    chain: list[int],
-    branch_targets: list[tuple[str, int]],
-    entries: list[GffStruct],
-    replies: list[GffStruct],
-    tlk: TlkTable,
-    speaker_hint: str,
-    *,
-    show_unresolved_checks: bool = False,
-) -> list[str]:
-    target_indices = [target for _label, target in branch_targets]
-    lines = [_entry_chain_heading(chain + target_indices), ""]
-
-    common_parts = _chain_turns(chain, entries, tlk, speaker_hint)
-    rendered_variants: list[tuple[str, list[str]]] = []
-    seen_variants: dict[str, int] = {}
-    for label, target in branch_targets:
-        variant_lines: list[str] = []
-        target_turns = _chain_turns([target], entries, tlk, speaker_hint)
-        for speaker, parts in _merge_turns(common_parts + target_turns):
-            text = _paragraph(" ".join(parts))
-            if speaker:
-                variant_lines.append(f"**{_md_escape(speaker)}:** {text}")
-            else:
-                variant_lines.append(text)
-        reply_lines = _reply_lines(
-            entries[target],
-            entries,
-            replies,
-            tlk,
-            show_unresolved_checks=show_unresolved_checks,
-        )
-        if reply_lines:
-            variant_lines.append("")
-            variant_lines.extend(reply_lines)
         fingerprint = _block_fingerprint(variant_lines)
         if fingerprint in seen_variants:
             existing_index = seen_variants[fingerprint]
