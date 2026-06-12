@@ -157,8 +157,25 @@ def render_dialogue(
                 rendered_any = True
                 continue
         if _is_orphan_entry(entry, entries, replies, tlk):
-            if not _auto_route_reaches_meaningful_replies(entry, entries, replies, tlk):
+            routed_chain = _auto_transcript_path_to_choices(index, entries, replies, tlk)
+            if not routed_chain:
                 continue
+            block = _render_transcript_chain_with_choices(
+                routed_chain,
+                entries,
+                replies,
+                tlk,
+                speaker_hint,
+                show_unresolved_checks=show_unresolved_checks,
+            )
+            if _block_seen(block, seen_blocks):
+                skip_entries.add(index)
+                continue
+            lines.extend(block)
+            skip_entries.update(routed_chain)
+            lines.append("---")
+            lines.append("")
+            rendered_any = True
             continue
         block = _render_entry(
             index,
@@ -268,6 +285,31 @@ def _auto_route_reaches_meaningful_replies(
             return True
         queue.extend(_auto_next_entries(candidate, replies, tlk))
     return False
+
+
+def _auto_transcript_path_to_choices(
+    start_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+) -> list[int]:
+    path: list[int] = []
+    seen: set[int] = set()
+    current = start_index
+
+    while 0 <= current < len(entries) and current not in seen:
+        seen.add(current)
+        path.append(current)
+        candidate = entries[current]
+        if _entry_has_meaningful_replies(candidate, entries, replies, tlk):
+            return path
+
+        next_entries = _auto_next_entries(candidate, replies, tlk)
+        if len(next_entries) != 1:
+            return []
+        current = next_entries[0]
+
+    return []
 
 
 def _auto_choice_targets(
