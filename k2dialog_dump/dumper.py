@@ -274,36 +274,38 @@ def _trivial_continue_next(entry: GffStruct, replies: list[GffStruct], tlk: TlkT
 
 
 def _auto_next_entries(entry: GffStruct, replies: list[GffStruct], tlk: TlkTable) -> list[int]:
-    links = _as_list(entry.get("RepliesList"))
-    if len(links) != 1:
-        return []
-
-    link = links[0]
-    reply_index = _index_from_link(link)
-    if reply_index is None or not (0 <= reply_index < len(replies)):
-        return []
-    if _visibility_check_lines(link, "") or _link_detail_lines(link):
-        return []
-
-    reply = replies[reply_index]
-    reply_text, _notes = _split_designer_notes(_resolve_text(reply, tlk))
-    if reply_text and reply_text.lower() != "[continue]":
-        return []
-    if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], replies, tlk):
-        return []
-
-    next_links = _as_list(reply.get("EntriesList"))
-    if not next_links:
+    links = _hidden_continue_links(entry, replies, tlk)
+    if not links:
         return []
 
     next_entries: list[int] = []
-    for next_link in next_links:
-        if _link_detail_lines(next_link):
+    for link in links:
+        reply = _linked_reply(link, replies)
+        if reply is None:
             continue
-        next_index = _index_from_link(next_link)
-        if next_index is not None:
-            next_entries.append(next_index)
+        for next_link in _as_list(reply.get("EntriesList")):
+            if _link_detail_lines(next_link):
+                continue
+            next_index = _index_from_link(next_link)
+            if next_index is not None:
+                next_entries.append(next_index)
     return next_entries
+
+
+def _hidden_continue_links(entry: GffStruct, replies: list[GffStruct], tlk: TlkTable) -> list[GffStruct]:
+    links = _as_list(entry.get("RepliesList"))
+    if not links:
+        return []
+    if not all(_is_trivial_continue_reply(link, replies, tlk) for link in links):
+        return []
+    return links
+
+
+def _linked_reply(link: GffStruct, replies: list[GffStruct]) -> GffStruct | None:
+    reply_index = _index_from_link(link)
+    if reply_index is None or not (0 <= reply_index < len(replies)):
+        return None
+    return replies[reply_index]
 
 
 def _auto_route_reaches_meaningful_replies(
@@ -448,34 +450,27 @@ def _append_entry_turn(turns: list[tuple[str, str]], entry: GffStruct, tlk: TlkT
 
 
 def _auto_next_entry_labels(entry: GffStruct, replies: list[GffStruct], tlk: TlkTable) -> list[tuple[str, int]]:
-    links = _as_list(entry.get("RepliesList"))
-    if len(links) != 1:
+    links = _hidden_continue_links(entry, replies, tlk)
+    if not links:
         return []
 
-    link = links[0]
-    reply_index = _index_from_link(link)
-    if reply_index is None or not (0 <= reply_index < len(replies)):
-        return []
-    if _visibility_check_lines(link, "") or _link_detail_lines(link):
-        return []
-
-    reply = replies[reply_index]
-    reply_text, _notes = _split_designer_notes(_resolve_text(reply, tlk))
-    if reply_text and reply_text.lower() != "[continue]":
-        return []
-    if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], replies, tlk):
-        return []
-
-    next_links = _as_list(reply.get("EntriesList"))
-    sibling_scripts = {_plain_text(next_link.get("Active")).lower() for next_link in next_links}
+    sibling_entry_scripts = {_plain_text(link.get("Active")).lower() for link in links}
 
     targets: list[tuple[str, int]] = []
-    for next_link in next_links:
-        if _link_detail_lines(next_link):
+    for link in links:
+        reply = _linked_reply(link, replies)
+        if reply is None:
             continue
-        next_index = _index_from_link(next_link)
-        if next_index is not None:
-            targets.append((_auto_link_condition_label(next_link, sibling_scripts), next_index))
+        next_links = _as_list(reply.get("EntriesList"))
+        sibling_scripts = {_plain_text(next_link.get("Active")).lower() for next_link in next_links}
+        link_label = _auto_link_condition_label(link, sibling_entry_scripts)
+        for next_link in next_links:
+            if _link_detail_lines(next_link):
+                continue
+            next_index = _index_from_link(next_link)
+            if next_index is not None:
+                next_label = _auto_link_condition_label(next_link, sibling_scripts)
+                targets.append((_condition_label_join(link_label, next_label), next_index))
     return targets
 
 
@@ -814,7 +809,8 @@ def _reply_lines(
     linked_replies = _as_list(entry.get("RepliesList"))
     if not linked_replies:
         return []
-    if len(linked_replies) == 1 and _is_trivial_continue_reply(linked_replies[0], replies, tlk):
+    linked_replies = [link for link in linked_replies if not _is_trivial_continue_reply(link, replies, tlk)]
+    if not linked_replies:
         return []
 
     reply_lines: list[str] = []
@@ -863,17 +859,107 @@ def _reply_line_text(
         prefix_tags.extend(_check_prefix_tags(check_lines, choice_text))
         annotations.extend(line for line in check_lines if not _check_prefix_tags_for_line(line, choice_text))
         if not check_lines:
-            annotations.extend(_routed_entry_effect_lines(reply, entries, replies, tlk))
+            routed_check_lines = _routed_entry_check_lines(reply, entries, replies, tlk)
+            if routed_check_lines:
+                prefix_tags.extend(_check_prefix_tags(routed_check_lines, choice_text))
+                annotations.extend(
+                    line for line in routed_check_lines if not _check_prefix_tags_for_line(line, choice_text)
+                )
+            else:
+                annotations.extend(_routed_entry_effect_lines(reply, entries, replies, tlk))
     elif show_unresolved_checks and _tag_without_check_line(reply_text, link, reply):
         annotations.append(_tag_without_check_line(reply_text, link, reply))
     if show_unresolved_checks and reply is not None and not check_lines and not visibility_lines:
         tag_line = _tag_without_check_line(reply_text, link, reply)
         if tag_line:
             annotations.append(tag_line)
-    annotations = list(dict.fromkeys(annotations))
+    annotations = _merged_annotations(annotations)
     detail = f" [{'; '.join(annotations)}]" if annotations else ""
     suffix = _choice_text(choice_text, prefix_tags)
     return f"{suffix}{detail}"
+
+
+def _merged_annotations(annotations: list[str]) -> list[str]:
+    merged: list[str] = []
+    effect_positions: dict[str, int] = {}
+    effect_totals: dict[str, int] = {}
+
+    for annotation in annotations:
+        effect = re.fullmatch(r"(.+? Influence|Light Side|Dark Side) ([+-]\d+)", annotation)
+        if effect:
+            label = effect.group(1)
+            amount = int(effect.group(2))
+            if label not in effect_positions:
+                effect_positions[label] = len(merged)
+                merged.append("")
+                effect_totals[label] = 0
+            effect_totals[label] += amount
+            continue
+
+        if annotation not in merged:
+            merged.append(annotation)
+
+    for label, position in effect_positions.items():
+        amount = effect_totals[label]
+        if amount:
+            merged[position] = f"{label} {amount:+d}"
+
+    return [annotation for annotation in merged if annotation]
+
+
+def _routed_entry_check_lines(
+    reply: GffStruct,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+) -> list[str]:
+    lines: list[str] = []
+    for entry_link in _as_list(reply.get("EntriesList")):
+        entry_index = _index_from_link(entry_link)
+        if entry_index is None or not (0 <= entry_index < len(entries)):
+            continue
+        lines.extend(_automatic_route_check_lines(entry_index, entries, replies, tlk, set()))
+    return list(dict.fromkeys(lines))
+
+
+def _automatic_route_check_lines(
+    entry_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    seen: set[int],
+) -> list[str]:
+    if entry_index in seen or not (0 <= entry_index < len(entries)):
+        return []
+
+    seen.add(entry_index)
+    entry = entries[entry_index]
+    entry_effects = _effect_lines(entry)
+    lines: list[str] = []
+
+    for link in _hidden_continue_links(entry, replies, tlk):
+        reply = _linked_reply(link, replies)
+        if reply is None:
+            continue
+
+        reply_text, _notes = _split_designer_notes(_resolve_text(reply, tlk))
+        prefix = entry_effects + _effect_lines(reply)
+        check_lines = _reply_check_lines(reply, reply_text, entries, replies, tlk)
+        if check_lines:
+            lines.extend(prefix + check_lines)
+            continue
+
+        for next_link in _as_list(reply.get("EntriesList")):
+            if _link_detail_lines(next_link):
+                continue
+            next_index = _index_from_link(next_link)
+            if next_index is None:
+                continue
+            child_lines = _automatic_route_check_lines(next_index, entries, replies, tlk, set(seen))
+            if child_lines:
+                lines.extend(prefix + child_lines)
+
+    return list(dict.fromkeys(lines))
 
 
 def _routed_entry_effect_lines(
@@ -898,40 +984,36 @@ def _automatic_route_effect_lines(
     tlk: TlkTable,
 ) -> list[str]:
     effects: list[str] = []
-    seen: set[int] = set()
-    current = start_index
-    while 0 <= current < len(entries) and current not in seen:
-        seen.add(current)
-        entry = entries[current]
-        effects.extend(_effect_lines(entry))
-
-        links = _as_list(entry.get("RepliesList"))
-        if len(links) != 1:
-            break
-        link = links[0]
-        if _link_detail_lines(link) or _visibility_check_lines(link, ""):
-            break
-
-        reply_index = _index_from_link(link)
-        if reply_index is None or not (0 <= reply_index < len(replies)):
-            break
-        reply = replies[reply_index]
-        reply_text, notes = _split_designer_notes(_resolve_text(reply, tlk))
-        if notes or (reply_text and reply_text.lower() != "[continue]"):
-            break
-
-        effects.extend(_effect_lines(reply))
-        if _reply_check_lines(reply, reply_text, entries, replies, tlk):
-            break
-
-        next_links = _as_list(reply.get("EntriesList"))
-        if len(next_links) != 1 or _link_detail_lines(next_links[0]):
-            break
-        next_index = _index_from_link(next_links[0])
-        if next_index is None:
-            break
-        current = next_index
+    _collect_automatic_route_effects(start_index, entries, replies, tlk, set(), effects)
     return list(dict.fromkeys(effects))
+
+
+def _collect_automatic_route_effects(
+    entry_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    seen: set[int],
+    effects: list[str],
+) -> None:
+    if entry_index in seen or not (0 <= entry_index < len(entries)):
+        return
+
+    seen.add(entry_index)
+    entry = entries[entry_index]
+    effects.extend(_effect_lines(entry))
+
+    for link in _hidden_continue_links(entry, replies, tlk):
+        reply = _linked_reply(link, replies)
+        if reply is None:
+            continue
+        effects.extend(_effect_lines(reply))
+        for next_link in _as_list(reply.get("EntriesList")):
+            if _link_detail_lines(next_link):
+                continue
+            next_index = _index_from_link(next_link)
+            if next_index is not None:
+                _collect_automatic_route_effects(next_index, entries, replies, tlk, set(seen), effects)
 
 
 def _resolve_text(node: GffStruct, tlk: TlkTable) -> str:
@@ -1612,9 +1694,7 @@ def _is_trivial_end_continue(link: GffStruct, replies: list[GffStruct], tlk: Tlk
         return False
 
     reply = replies[reply_index]
-    reply_text, notes = _split_designer_notes(_resolve_text(reply, tlk))
-    if notes:
-        return False
+    reply_text, _notes = _split_designer_notes(_resolve_text(reply, tlk))
     if reply_text and reply_text.lower() != "[continue]":
         return False
     if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], replies, tlk):
@@ -1630,12 +1710,8 @@ def _is_trivial_continue_reply(link: GffStruct, replies: list[GffStruct], tlk: T
         return False
 
     reply = replies[reply_index]
-    reply_text, notes = _split_designer_notes(_resolve_text(reply, tlk))
-    if notes:
-        return False
+    reply_text, _notes = _split_designer_notes(_resolve_text(reply, tlk))
     if reply_text and reply_text.lower() != "[continue]":
-        return False
-    if _effect_lines(reply) or _reply_check_lines(reply, reply_text, [], replies, tlk):
         return False
     return True
 
