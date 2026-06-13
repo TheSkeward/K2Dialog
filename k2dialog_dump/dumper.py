@@ -2228,8 +2228,10 @@ def _propagate_script_state_effects(
     changed = True
     while changed:
         changed = False
-        for analysis in script_analysis.values():
+        for script, analysis in script_analysis.items():
             if not analysis.state_conditions:
+                continue
+            if _skip_state_effect_propagation(script, analysis):
                 continue
             downstream_effects: list[str] = []
             for state_name, value in analysis.constant_global_sets.get(0, []):
@@ -2241,6 +2243,14 @@ def _propagate_script_state_effects(
                 _extend_unique(effects_by_state[state], downstream_effects)
                 if len(effects_by_state[state]) != before:
                     changed = True
+
+
+def _skip_state_effect_propagation(script: str, analysis: NcsStateAnalysis) -> bool:
+    if re.fullmatch(r"k_.+_enter", script):
+        return True
+
+    downstream_sets = sum(len(pairs) for pairs in analysis.constant_global_sets.values())
+    return len(analysis.state_conditions) > 6 or downstream_sets > 12
 
 
 def _contextual_script_effects(
