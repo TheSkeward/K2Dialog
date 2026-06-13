@@ -190,6 +190,38 @@ def render_dialogue(
             lines.append("")
             rendered_any = True
             continue
+        forced_paths = _forced_reply_transcript_paths_to_choices(
+            index,
+            entries,
+            replies,
+            tlk,
+            speaker_hint,
+            state_effects,
+        )
+        if forced_paths:
+            block = _render_forced_reply_transcript_paths(
+                forced_paths,
+                entries,
+                replies,
+                tlk,
+                speaker_hint,
+                state_effects,
+                show_unresolved_checks=show_unresolved_checks,
+            )
+            prefix_indices, _prefix_turns, routed_paths = forced_paths
+            if _block_seen(block, seen_blocks):
+                skip_entries.update(prefix_indices)
+                for _label, path in routed_paths:
+                    skip_entries.update(path)
+                continue
+            lines.extend(block)
+            skip_entries.update(prefix_indices)
+            for _label, path in routed_paths:
+                skip_entries.update(path)
+            lines.append("---")
+            lines.append("")
+            rendered_any = True
+            continue
         chain = _linear_continue_chain(index, entries, replies, tlk, speaker_hint)
         if len(chain) >= 2:
             last_entry = entries[chain[-1]]
@@ -521,6 +553,71 @@ def _forced_reply_transcript_path_to_choices(
     return None
 
 
+def _forced_reply_transcript_paths_to_choices(
+    start_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    speaker_hint: str,
+    state_effects: StateEffectIndex,
+) -> tuple[list[int], list[tuple[str, str]], list[tuple[str, list[int]]]] | None:
+    entry_indices: list[int] = []
+    turns: list[tuple[str, str]] = []
+    seen_entries: set[int] = set()
+    forced_reply_count = 0
+    current = start_index
+
+    while 0 <= current < len(entries) and current not in seen_entries:
+        seen_entries.add(current)
+        entry_indices.append(current)
+        entry = entries[current]
+        _append_entry_turn(turns, current, entries, replies, tlk, speaker_hint)
+
+        hidden_next = _trivial_continue_next(entry, replies, tlk)
+        if hidden_next is not None:
+            current = hidden_next
+            continue
+
+        reply_lines = _reply_lines(entry, entries, replies, tlk, state_effects)
+        if len(reply_lines) != 1:
+            return None
+
+        links = _as_list(entry.get("RepliesList"))
+        if len(links) != 1:
+            return None
+        link = links[0]
+        reply_index = _index_from_link(link)
+        if reply_index is None or not (0 <= reply_index < len(replies)):
+            return None
+        reply = replies[reply_index]
+        reply_text, _reply_notes = _split_designer_notes(_resolve_text(reply, tlk))
+        if _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects):
+            return None
+
+        next_links = _as_list(reply.get("EntriesList"))
+        if len(next_links) != 1:
+            return None
+        next_link = next_links[0]
+        if _link_detail_lines(next_link):
+            return None
+        next_index = _index_from_link(next_link)
+        if next_index is None:
+            return None
+
+        turn_text = _reply_line_text(link, entries, replies, tlk, state_effects)
+        if not turn_text:
+            return None
+        turns.append(("Exile", turn_text))
+        forced_reply_count += 1
+
+        routed_paths = _auto_transcript_paths_to_choices(next_index, entries, replies, tlk)
+        if routed_paths and forced_reply_count:
+            return entry_indices, turns, routed_paths
+        current = next_index
+
+    return None
+
+
 def _append_entry_turn(
     turns: list[tuple[str, str]],
     entry_index: int,
@@ -689,6 +786,64 @@ def _render_forced_reply_transcript_path(
     if reply_lines:
         lines.append("")
         lines.extend(reply_lines)
+    return lines
+
+
+def _render_forced_reply_transcript_paths(
+    path: tuple[list[int], list[tuple[str, str]], list[tuple[str, list[int]]]],
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    speaker_hint: str,
+    state_effects: StateEffectIndex,
+    *,
+    show_unresolved_checks: bool = False,
+) -> list[str]:
+    prefix_indices, prefix_turns, routed_paths = path
+    combined_paths = [(label, prefix_indices + routed_path) for label, routed_path in routed_paths]
+    lines = [_entry_chain_heading(_combined_path_indices(combined_paths)), ""]
+    prefix = [(speaker, [text]) for speaker, text in prefix_turns]
+
+    rendered_variants: list[tuple[str, list[str]]] = []
+    seen_variants: dict[str, int] = {}
+    for label, routed_path in routed_paths:
+        variant_lines: list[str] = []
+        turns = prefix + _chain_turns(routed_path, entries, replies, tlk, speaker_hint)
+        for speaker, parts in _merge_turns(turns):
+            text = _paragraph(" ".join(parts))
+            if speaker:
+                variant_lines.append(f"**{_md_escape(speaker)}:** {text}")
+            else:
+                variant_lines.append(text)
+
+        reply_lines = _reply_lines(
+            entries[routed_path[-1]],
+            entries,
+            replies,
+            tlk,
+            state_effects,
+            show_unresolved_checks=show_unresolved_checks,
+        )
+        if reply_lines:
+            variant_lines.append("")
+            variant_lines.extend(reply_lines)
+
+        fingerprint = _block_fingerprint(variant_lines)
+        if fingerprint in seen_variants:
+            existing_index = seen_variants[fingerprint]
+            existing_label, existing_lines = rendered_variants[existing_index]
+            rendered_variants[existing_index] = (_combine_variant_labels(existing_label, label), existing_lines)
+            continue
+        seen_variants[fingerprint] = len(rendered_variants)
+        rendered_variants.append((label, variant_lines))
+
+    show_variant_headings = len(rendered_variants) > 1 or any(label for label, _variant_lines in rendered_variants)
+    for label, variant_lines in rendered_variants:
+        if show_variant_headings:
+            heading = f" ({label})" if label else ""
+            lines.append(f"Variant{heading}:")
+        lines.extend(variant_lines)
+        lines.append("")
     return lines
 
 
