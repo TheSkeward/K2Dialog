@@ -42,6 +42,8 @@ class StateEffectIndex:
     contextual_script_effects: dict[tuple[str, str, int], list[str]] | None = None
     cross_module_script_effects: dict[tuple[str, int], list[str]] | None = None
     current_module: str | None = None
+    route_effect_cache: dict[tuple[int, int, bool, tuple[int, ...]], list[str]] | None = None
+    common_reply_effect_cache: dict[tuple[int, int, tuple[int, ...]], list[str]] | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +140,8 @@ def render_dialogue(
 ) -> str:
     state_effects = state_effects or StateEffectIndex({}, {}, {})
     state_effects.current_module = (resource.module_name or "").lower()
+    state_effects.route_effect_cache = {}
+    state_effects.common_reply_effect_cache = {}
     entries = _as_list(root.get("EntryList"))
     replies = _as_list(root.get("ReplyList"))
     speaker_hint = _conversation_speaker_hint(resource, root)
@@ -280,12 +284,8 @@ def render_dialogue(
                     for _label, path in branch_paths:
                         skip_entries.update(path)
                 else:
-                    block = _render_transcript_chain(transcript_chain, entries, replies, tlk, speaker_hint)
-                    if _block_seen(block, seen_blocks):
-                        skip_entries.update(transcript_chain)
-                        continue
-                    lines.extend(block)
                     skip_entries.update(transcript_chain)
+                    continue
                 lines.append("---")
                 lines.append("")
                 rendered_any = True
@@ -324,6 +324,9 @@ def render_dialogue(
             lines.append("")
             rendered_any = True
             continue
+        if not _entry_has_meaningful_replies(entry, entries, replies, tlk):
+            continue
+
         block = _render_entry(
             index,
             entry,
@@ -717,11 +720,6 @@ def _render_transcript_chain(
             else:
                 turns.append((speaker, [text]))
 
-    if not turns:
-        if speaker_hint:
-            lines.append(f"**{_md_escape(speaker_hint)}:** [no prompt shown]")
-        else:
-            lines.append("[no prompt shown]")
     for speaker, parts in turns:
         text = _paragraph(" ".join(parts))
         if speaker:
@@ -1040,11 +1038,12 @@ def _render_entry(
     lines = [f"## Entry {index}", ""]
     speaker = _entry_speaker(entry, speaker_hint)
     text, notes = _split_designer_notes(_resolve_text(entry, tlk))
-    line_text = _display_text(text or "[no text]", speaker)
-    if speaker:
-        lines.extend(_speaker_text_lines(speaker, line_text))
-    else:
-        lines.append(line_text)
+    if text:
+        line_text = _display_text(text, speaker)
+        if speaker:
+            lines.extend(_speaker_text_lines(speaker, line_text))
+        else:
+            lines.append(line_text)
 
     reply_lines = _reply_lines(
         entry,
@@ -1125,6 +1124,7 @@ def _reply_line_parts(
     show_unresolved_checks: bool = False,
     include_common_reply_effects: bool = True,
     include_outcome_annotations: bool = True,
+    common_effect_seen: set[int] | None = None,
 ) -> ReplyLineParts | None:
     state_effects = state_effects or StateEffectIndex({}, {}, {})
     reply_index = _index_from_link(link)
@@ -1167,6 +1167,7 @@ def _reply_line_parts(
                             tlk,
                             state_effects,
                             include_common_reply_effects=include_common_reply_effects,
+                            common_effect_seen=common_effect_seen,
                         )
                     )
     elif show_unresolved_checks and _tag_without_check_line(reply_text, link, reply):
@@ -1178,9 +1179,25 @@ def _reply_line_parts(
     return ReplyLineParts(_choice_text(choice_text, prefix_tags), _merged_annotations(annotations))
 
 
-def _format_reply_line(parts: ReplyLineParts, omitted_annotations: list[str] | None = None) -> str:
-    omitted = set(omitted_annotations or [])
-    annotations = [annotation for annotation in parts.annotations if annotation not in omitted]
+def _format_reply_line(parts: ReplyLineParts, common_effects: list[str] | None = None) -> str:
+    common_totals = _effect_totals(common_effects or [])
+    annotations: list[str] = []
+    for annotation in parts.annotations:
+        parsed = _parse_effect_annotation(annotation)
+        if parsed is None:
+            annotations.append(annotation)
+            continue
+
+        label, amount = parsed
+        common = common_totals.get(label)
+        if common is None:
+            annotations.append(annotation)
+            continue
+
+        remaining = amount - common
+        if remaining:
+            annotations.append(f"{label} {remaining:+d}")
+
     detail = f" [{'; '.join(annotations)}]" if annotations else ""
     return f"{parts.text}{detail}"
 
@@ -1188,19 +1205,63 @@ def _format_reply_line(parts: ReplyLineParts, omitted_annotations: list[str] | N
 def _common_effect_annotations(parts: list[ReplyLineParts]) -> list[str]:
     if not parts:
         return []
+    return _common_effect_annotations_from_lists([part.annotations for part in parts])
 
-    effect_sets = [{annotation for annotation in part.annotations if _is_effect_annotation(annotation)} for part in parts]
-    if not effect_sets or any(not effect_set for effect_set in effect_sets):
+
+def _common_effect_annotations_from_lists(annotation_lists: list[list[str]]) -> list[str]:
+    if not annotation_lists:
         return []
 
-    common = set.intersection(*effect_sets)
-    if not common:
+    effect_maps = [_effect_totals(annotations) for annotations in annotation_lists]
+    if not effect_maps or any(not effect_map for effect_map in effect_maps):
         return []
-    return [annotation for annotation in parts[0].annotations if annotation in common]
+
+    common_labels = set.intersection(*(set(effect_map) for effect_map in effect_maps))
+    if not common_labels:
+        return []
+
+    common_totals: dict[str, int] = {}
+    for label in common_labels:
+        amounts = [effect_map[label] for effect_map in effect_maps]
+        if all(amount > 0 for amount in amounts):
+            common_totals[label] = min(amounts)
+        elif all(amount < 0 for amount in amounts):
+            common_totals[label] = -min(abs(amount) for amount in amounts)
+
+    if not common_totals:
+        return []
+
+    ordered: list[str] = []
+    for annotation in annotation_lists[0]:
+        parsed = _parse_effect_annotation(annotation)
+        if parsed is None:
+            continue
+        label, _amount = parsed
+        if label in common_totals and label not in ordered:
+            ordered.append(label)
+    return [f"{label} {common_totals[label]:+d}" for label in ordered]
+
+
+def _effect_totals(annotations: list[str]) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for annotation in annotations:
+        parsed = _parse_effect_annotation(annotation)
+        if parsed is None:
+            continue
+        label, amount = parsed
+        totals[label] = totals.get(label, 0) + amount
+    return {label: amount for label, amount in totals.items() if amount}
 
 
 def _is_effect_annotation(annotation: str) -> bool:
     return EFFECT_ANNOTATION_RE.fullmatch(annotation) is not None
+
+
+def _parse_effect_annotation(annotation: str) -> tuple[str, int] | None:
+    effect = EFFECT_ANNOTATION_RE.fullmatch(annotation)
+    if not effect:
+        return None
+    return effect.group(1), int(effect.group(2))
 
 
 def _merged_annotations(annotations: list[str]) -> list[str]:
@@ -1297,14 +1358,15 @@ def _routed_entry_effect_lines(
     state_effects: StateEffectIndex | None = None,
     *,
     include_common_reply_effects: bool = True,
+    common_effect_seen: set[int] | None = None,
 ) -> list[str]:
     state_effects = state_effects or StateEffectIndex({}, {}, {})
-    effects: list[str] = []
+    branch_effects: list[list[str]] = []
     for entry_link in _as_list(reply.get("EntriesList")):
         entry_index = _index_from_link(entry_link)
         if entry_index is None or not (0 <= entry_index < len(entries)):
             continue
-        effects.extend(
+        branch_effects.append(
             _automatic_route_effect_lines(
                 entry_index,
                 entries,
@@ -1312,9 +1374,14 @@ def _routed_entry_effect_lines(
                 tlk,
                 state_effects,
                 include_common_reply_effects=include_common_reply_effects,
+                common_effect_seen=common_effect_seen,
             )
         )
-    return list(dict.fromkeys(effects))
+    if not branch_effects:
+        return []
+    if len(branch_effects) == 1:
+        return branch_effects[0]
+    return _common_annotations(branch_effects)
 
 
 def _automatic_route_effect_lines(
@@ -1325,9 +1392,16 @@ def _automatic_route_effect_lines(
     state_effects: StateEffectIndex | None = None,
     *,
     include_common_reply_effects: bool = True,
+    common_effect_seen: set[int] | None = None,
 ) -> list[str]:
     state_effects = state_effects or StateEffectIndex({}, {}, {})
-    return _automatic_route_effect_path(
+    seen_key = tuple(sorted(common_effect_seen or set()))
+    cache_key = (id(entries), start_index, include_common_reply_effects, seen_key)
+    cache = state_effects.route_effect_cache
+    if cache is not None and cache_key in cache:
+        return list(cache[cache_key])
+
+    result = _automatic_route_effect_path(
         start_index,
         entries,
         replies,
@@ -1336,7 +1410,11 @@ def _automatic_route_effect_lines(
         state_effects,
         [],
         include_common_reply_effects=include_common_reply_effects,
+        common_effect_seen=common_effect_seen or set(),
     )
+    if cache is not None:
+        cache[cache_key] = list(result)
+    return result
 
 
 def _automatic_route_effect_path(
@@ -1349,6 +1427,7 @@ def _automatic_route_effect_path(
     path_effects: list[str],
     *,
     include_common_reply_effects: bool = True,
+    common_effect_seen: set[int],
 ) -> list[str]:
     if entry_index in seen or not (0 <= entry_index < len(entries)):
         return []
@@ -1363,8 +1442,17 @@ def _automatic_route_effect_path(
     hidden_links = _hidden_continue_links(entry, replies, tlk)
     if not hidden_links:
         effects = list(entry_effects)
-        if include_common_reply_effects:
-            effects.extend(_common_reply_effects(entry, entries, replies, tlk, state_effects))
+        if include_common_reply_effects and entry_index not in common_effect_seen:
+            effects.extend(
+                _common_reply_effects(
+                    entry,
+                    entries,
+                    replies,
+                    tlk,
+                    state_effects,
+                    common_effect_seen | {entry_index},
+                )
+            )
         return _merged_annotations(effects)
 
     branches: list[list[str]] = []
@@ -1402,6 +1490,7 @@ def _automatic_route_effect_path(
                     state_effects,
                     path_effects + reply_effects,
                     include_common_reply_effects=include_common_reply_effects,
+                    common_effect_seen=common_effect_seen,
                 )
                 branches.append(_merged_annotations(reply_effects + child_effects))
 
@@ -1415,11 +1504,28 @@ def _automatic_route_effect_path(
 def _common_annotations(branches: list[list[str]]) -> list[str]:
     if not branches:
         return []
-    branch_sets = [set(branch) for branch in branches]
-    if any(not branch_set for branch_set in branch_sets):
-        return []
-    common = set.intersection(*branch_sets)
-    return [annotation for annotation in branches[0] if annotation in common]
+    common_effects = _common_effect_annotations_from_lists(branches)
+    non_effect_sets = [
+        {annotation for annotation in branch if not _is_effect_annotation(annotation)}
+        for branch in branches
+    ]
+    common_non_effects: set[str] = set()
+    if non_effect_sets and all(non_effect_sets):
+        common_non_effects = set.intersection(*non_effect_sets)
+
+    common: list[str] = []
+    for annotation in branches[0]:
+        if _is_effect_annotation(annotation):
+            parsed = _parse_effect_annotation(annotation)
+            if parsed is None:
+                continue
+            label, _amount = parsed
+            replacement = next((effect for effect in common_effects if effect.startswith(f"{label} ")), None)
+            if replacement and replacement not in common:
+                common.append(replacement)
+        elif annotation in common_non_effects:
+            common.append(annotation)
+    return common
 
 
 def _common_reply_effects(
@@ -1428,27 +1534,77 @@ def _common_reply_effects(
     replies: list[GffStruct],
     tlk: TlkTable,
     state_effects: StateEffectIndex,
+    common_effect_seen: set[int] | None = None,
 ) -> list[str]:
+    common_effect_seen = common_effect_seen or set()
+    seen_key = tuple(sorted(common_effect_seen))
+    cache_key = (id(entries), id(entry), seen_key)
+    cache = state_effects.common_reply_effect_cache
+    if cache is not None and cache_key in cache:
+        return list(cache[cache_key])
+
     linked_replies = _as_list(entry.get("RepliesList"))
     if len(linked_replies) < 2:
         return []
 
     parts: list[ReplyLineParts] = []
+    visible_links: list[GffStruct] = []
     for link in linked_replies:
         if _is_trivial_continue_reply(link, replies, tlk):
             continue
-        line_parts = _reply_line_parts(
-            link,
+        reply = _linked_reply(link, replies)
+        if reply is None:
+            continue
+        annotations = _effect_lines(reply)
+        annotations.extend(
+            _routed_entry_effect_lines(
+                reply,
+                entries,
+                replies,
+                tlk,
+                state_effects,
+                include_common_reply_effects=False,
+                common_effect_seen=common_effect_seen,
+            )
+        )
+        parts.append(ReplyLineParts("", _merged_annotations(annotations)))
+        visible_links.append(link)
+
+    if len(parts) < 2:
+        return []
+
+    common = _common_effect_annotations(parts)
+    next_indices = [
+        _single_unconditional_reply_next_entry(link, replies)
+        for link in visible_links
+    ]
+    same_next = next_indices and all(index is not None and index == next_indices[0] for index in next_indices)
+    if same_next and next_indices[0] not in common_effect_seen:
+        nested = _common_reply_effects(
+            entries[next_indices[0]],
             entries,
             replies,
             tlk,
             state_effects,
-            include_common_reply_effects=False,
-            include_outcome_annotations=False,
+            common_effect_seen | {next_indices[0]},
         )
-        if line_parts is not None:
-            parts.append(line_parts)
-    return _common_effect_annotations(parts) if len(parts) >= 2 else []
+        common = _merged_annotations(common + nested)
+    if cache is not None:
+        cache[cache_key] = list(common)
+    return common
+
+
+def _single_unconditional_reply_next_entry(link: GffStruct, replies: list[GffStruct]) -> int | None:
+    reply = _linked_reply(link, replies)
+    if reply is None:
+        return None
+    next_links = _as_list(reply.get("EntriesList"))
+    if len(next_links) != 1:
+        return None
+    next_link = next_links[0]
+    if _link_detail_lines(next_link) or _visibility_check_lines(next_link, ""):
+        return None
+    return _index_from_link(next_link)
 
 
 def _resolve_text(node: GffStruct, tlk: TlkTable) -> str:
@@ -1524,10 +1680,18 @@ def _reply_check_lines(
 
     success_checks = gt_checks + attr_gt_checks
     if len(success_checks) > 1:
-        success_checks.sort(key=lambda item: int(item[0]["dc"]), reverse=True)
-        for check, entry_index in success_checks:
+        grouped_success_checks: list[tuple[dict[str, object], list[int]]] = []
+        grouped_by_condition: dict[str, int] = {}
+        for check, entry_index in sorted(success_checks, key=lambda item: int(item[0]["dc"]), reverse=True):
             condition = _outcome_check_condition(check, reply_text)
-            lines.append(f"{condition}: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
+            if condition in grouped_by_condition:
+                grouped_success_checks[grouped_by_condition[condition]][1].append(entry_index)
+            else:
+                grouped_by_condition[condition] = len(grouped_success_checks)
+                grouped_success_checks.append((check, [entry_index]))
+        for check, entry_indices in grouped_success_checks:
+            condition = _outcome_check_condition(check, reply_text)
+            lines.append(f"{condition}: {_common_entry_outcome(entry_indices, entries, replies, tlk, state_effects)}")
         if fallback_entries:
             lines.append(f"otherwise: {_entry_outcomes(fallback_entries, entries, replies, tlk, state_effects)}")
         for check, entry_index in lt_checks:
@@ -2509,6 +2673,32 @@ def _entry_outcomes(
     return ", ".join(_entry_outcome(index, entries, replies, tlk, state_effects) for index in indices)
 
 
+def _common_entry_outcome(
+    indices: list[int],
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex | None = None,
+) -> str:
+    state_effects = state_effects or StateEffectIndex({}, {}, {})
+    outcomes = [_entry_outcome(index, entries, replies, tlk, state_effects) for index in indices]
+    unique_outcomes = list(dict.fromkeys(outcome for outcome in outcomes if outcome))
+    if len(unique_outcomes) == 1:
+        return unique_outcomes[0]
+
+    branch_effects = [
+        _automatic_route_effect_lines(index, entries, replies, tlk, state_effects)
+        for index in indices
+        if 0 <= index < len(entries)
+    ]
+    common = _common_annotations(branch_effects)
+    if common:
+        return ", ".join(common)
+    if unique_outcomes:
+        return " / ".join(unique_outcomes)
+    return _entry_outcomes(indices, entries, replies, tlk, state_effects)
+
+
 def _entry_outcome(
     index: int,
     entries: list[GffStruct],
@@ -2968,7 +3158,7 @@ def _is_trivial_end_continue(link: GffStruct, replies: list[GffStruct], tlk: Tlk
 
 
 def _is_trivial_continue_reply(link: GffStruct, replies: list[GffStruct], tlk: TlkTable) -> bool:
-    if _link_detail_lines(link) or _visibility_check_lines(link, ""):
+    if _link_detail_lines(link):
         return False
     reply_index = _index_from_link(link)
     if reply_index is None or not (0 <= reply_index < len(replies)):
@@ -3583,11 +3773,11 @@ def _multiline_text(text: str) -> str:
 def _split_designer_notes(text: str) -> tuple[str, list[str]]:
     notes: list[str] = []
     remaining = text.strip()
-    for match in re.finditer(r"\{([^{}]+)\}", remaining):
+    for match in re.finditer(r"\{([^{}]*)\}", remaining):
         note = match.group(1).strip()
         if note:
             notes.append(note)
-    remaining = re.sub(r"[ \t]*\{[^{}]+\}[ \t]*", " ", remaining)
+    remaining = re.sub(r"[ \t]*\{[^{}]*\}[ \t]*", " ", remaining)
     remaining = re.sub(r"[ \t]+", " ", remaining).strip()
     remaining = re.sub(r"[ \t]+([,.;:?!])", r"\1", remaining)
     return remaining, notes
