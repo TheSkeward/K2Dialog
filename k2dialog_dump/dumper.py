@@ -147,6 +147,8 @@ def render_dialogue(
             continue
         if _is_empty_transition_entry(entry, replies, tlk):
             continue
+        if _is_forced_terminal_entry(index, entries, replies, tlk, state_effects):
+            continue
         forced_path = _forced_reply_transcript_path_to_choices(
             index,
             entries,
@@ -1388,11 +1390,106 @@ def _build_state_effect_index(
         for param_value, pairs in analysis.constant_global_sets.items():
             constant_global_sets[(script, param_value)] = list(dict.fromkeys(pairs))
 
+    state_effects = StateEffectIndex(
+        effects_by_state=effects_by_state,
+        dynamic_global_sets=dynamic_global_sets,
+        constant_global_sets=constant_global_sets,
+    )
+    start_states = _start_condition_states(parsed, script_analysis)
+    for script, global_name, value, effects in _forced_terminal_start_transitions(parsed, tlk, state_effects):
+        for (candidate_script, _param_value), pairs in constant_global_sets.items():
+            if candidate_script != script:
+                continue
+            for candidate_global, candidate_value in pairs:
+                key = (_state_key(candidate_global), candidate_value)
+                if _state_key(candidate_global) != _state_key(global_name):
+                    continue
+                if candidate_value == value or key not in start_states:
+                    continue
+                _extend_unique(effects_by_state.setdefault(key, []), effects)
+
     return StateEffectIndex(
         effects_by_state=effects_by_state,
         dynamic_global_sets=dynamic_global_sets,
         constant_global_sets=constant_global_sets,
     )
+
+
+def _start_condition_states(
+    parsed: list[ParsedDialogue],
+    script_analysis: dict[str, NcsStateAnalysis],
+) -> set[tuple[str, int]]:
+    states: set[tuple[str, int]] = set()
+    for item in parsed:
+        for start_link in _as_list(item.root.get("StartingList")):
+            for field, suffix in (("Active", ""), ("Active2", "b")):
+                script = _script_key(_plain_text(start_link.get(field)))
+                value = _condition_param(start_link, 1, suffix)
+                if not script or value is None:
+                    continue
+                analysis = script_analysis.get(script)
+                if analysis is None:
+                    continue
+                for global_name in analysis.global_reads:
+                    states.add((_state_key(global_name), value))
+    return states
+
+
+def _forced_terminal_start_transitions(
+    parsed: list[ParsedDialogue],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex,
+) -> list[tuple[str, str, int, list[str]]]:
+    transitions: list[tuple[str, str, int, list[str]]] = []
+    for item in parsed:
+        entries = _as_list(item.root.get("EntryList"))
+        replies = _as_list(item.root.get("ReplyList"))
+        for start_link in _as_list(item.root.get("StartingList")):
+            entry_index = _index_from_link(start_link)
+            if entry_index is None:
+                continue
+            transitions.extend(
+                _forced_terminal_route_transitions(entry_index, entries, replies, tlk, state_effects)
+            )
+    return transitions
+
+
+def _forced_terminal_route_transitions(
+    entry_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex,
+) -> list[tuple[str, str, int, list[str]]]:
+    if not _is_forced_terminal_entry(entry_index, entries, replies, tlk, state_effects):
+        return []
+
+    transitions: list[tuple[str, str, int, list[str]]] = []
+    seen: set[int] = set()
+    current = entry_index
+    while 0 <= current < len(entries) and current not in seen:
+        seen.add(current)
+        entry = entries[current]
+        transitions.extend(_state_transition_effect_details(entry, state_effects))
+
+        links = _as_list(entry.get("RepliesList"))
+        if not links:
+            break
+        link = links[0]
+        reply = _linked_reply(link, replies)
+        if reply is None:
+            break
+        transitions.extend(_state_transition_effect_details(reply, state_effects))
+
+        next_links = _as_list(reply.get("EntriesList"))
+        if not next_links:
+            break
+        next_index = _index_from_link(next_links[0])
+        if next_index is None:
+            break
+        current = next_index
+
+    return transitions
 
 
 def _script_state_analyses(scripts: list[ScriptResource]) -> dict[str, NcsStateAnalysis]:
@@ -1583,6 +1680,16 @@ def _is_jump_zero(instruction: NcsInstruction) -> bool:
 
 def _state_transition_effect_lines(node: GffStruct, state_effects: StateEffectIndex) -> list[str]:
     effects: list[str] = []
+    for _script, _global_name, _value, transition_effects in _state_transition_effect_details(node, state_effects):
+        effects.extend(transition_effects)
+    return _merged_annotations(effects)
+
+
+def _state_transition_effect_details(
+    node: GffStruct,
+    state_effects: StateEffectIndex,
+) -> list[tuple[str, str, int, list[str]]]:
+    details: list[tuple[str, str, int, list[str]]] = []
     for script, params in _action_script_calls(node):
         script_key = _script_key(script)
         if not script_key:
@@ -1590,12 +1697,16 @@ def _state_transition_effect_lines(node: GffStruct, state_effects: StateEffectIn
         state_value = params[0] if params else 0
 
         for global_name, value in state_effects.constant_global_sets.get((script_key, state_value), []):
-            effects.extend(state_effects.effects_by_state.get((_state_key(global_name), value), []))
+            effects = state_effects.effects_by_state.get((_state_key(global_name), value), [])
+            if effects:
+                details.append((script_key, global_name, value, _merged_annotations(effects)))
 
         for global_name in state_effects.dynamic_global_sets.get(script_key, []):
-            effects.extend(state_effects.effects_by_state.get((_state_key(global_name), state_value), []))
+            effects = state_effects.effects_by_state.get((_state_key(global_name), state_value), [])
+            if effects:
+                details.append((script_key, global_name, state_value, _merged_annotations(effects)))
 
-    return _merged_annotations(effects)
+    return details
 
 
 def _script_key(script: str) -> str:
@@ -2060,7 +2171,68 @@ def _entry_has_meaningful_replies(
     replies: list[GffStruct],
     tlk: TlkTable,
 ) -> bool:
-    return bool(_reply_lines(entry, entries, replies, tlk))
+    return len(_reply_lines(entry, entries, replies, tlk)) >= 2
+
+
+def _is_forced_terminal_entry(
+    entry_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex,
+) -> bool:
+    return _forced_terminal_entry_end(entry_index, entries, replies, tlk, state_effects, set())
+
+
+def _forced_terminal_entry_end(
+    entry_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex,
+    seen: set[int],
+) -> bool:
+    if entry_index in seen or not (0 <= entry_index < len(entries)):
+        return False
+
+    seen.add(entry_index)
+    entry = entries[entry_index]
+    reply_lines = _reply_lines(entry, entries, replies, tlk, state_effects)
+    if not reply_lines:
+        return not _auto_route_reaches_meaningful_replies(entry, entries, replies, tlk)
+    if len(reply_lines) != 1:
+        return False
+
+    links = _as_list(entry.get("RepliesList"))
+    if len(links) != 1:
+        return False
+    link = links[0]
+    if _link_detail_lines(link):
+        return False
+
+    reply = _linked_reply(link, replies)
+    if reply is None:
+        return True
+
+    reply_text, _notes = _split_designer_notes(_resolve_text(reply, tlk))
+    if _visibility_check_lines(link, reply_text):
+        return False
+    if _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects):
+        return False
+
+    next_links = _as_list(reply.get("EntriesList"))
+    if not next_links:
+        return True
+    if len(next_links) != 1:
+        return False
+    next_link = next_links[0]
+    if _link_detail_lines(next_link) or _visibility_check_lines(next_link, ""):
+        return False
+
+    next_index = _index_from_link(next_link)
+    if next_index is None:
+        return True
+    return _forced_terminal_entry_end(next_index, entries, replies, tlk, state_effects, seen)
 
 
 def _is_trivial_end_continue(link: GffStruct, replies: list[GffStruct], tlk: TlkTable) -> bool:
