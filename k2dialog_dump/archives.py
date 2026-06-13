@@ -308,8 +308,15 @@ def _script_resource(path: Path, script_name: str, data: bytes) -> ScriptResourc
 def _dedupe_dialogue_resources(resources: list[DialogueResource]) -> list[DialogueResource]:
     best: dict[tuple[str, str], DialogueResource] = {}
     order: list[tuple[str, str]] = []
+    override_names = {resource.dlg_name.lower() for resource in resources if resource.archive_name is None}
     for resource in resources:
-        key = ((resource.module_name or "").lower(), resource.dlg_name.lower())
+        name = resource.dlg_name.lower()
+        if name in override_names:
+            if resource.archive_name is not None:
+                continue
+            key = ("override", name)
+        else:
+            key = ((resource.module_name or "").lower(), name)
         existing = best.get(key)
         if existing is None:
             best[key] = resource
@@ -323,8 +330,15 @@ def _dedupe_dialogue_resources(resources: list[DialogueResource]) -> list[Dialog
 def _dedupe_script_resources(resources: list[ScriptResource]) -> list[ScriptResource]:
     best: dict[tuple[str, str], ScriptResource] = {}
     order: list[tuple[str, str]] = []
+    override_names = {resource.script_name.lower() for resource in resources if resource.archive_name is None}
     for resource in resources:
-        key = ((resource.module_name or "").lower(), resource.script_name.lower())
+        name = resource.script_name.lower()
+        if name in override_names:
+            if resource.archive_name is not None:
+                continue
+            key = ("override", name)
+        else:
+            key = ((resource.module_name or "").lower(), name)
         existing = best.get(key)
         if existing is None:
             best[key] = resource
