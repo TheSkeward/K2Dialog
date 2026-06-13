@@ -82,6 +82,11 @@ def find_script_resources(game_dir: Path) -> list[ScriptResource]:
             except Exception as exc:
                 LOGGER.warning("skipped %s scripts: %s", path, exc)
 
+    try:
+        resources.extend(read_key_scripts(game_dir))
+    except Exception as exc:
+        LOGGER.warning("skipped base BIF scripts: %s", exc)
+
     return _dedupe_script_resources(resources)
 
 
@@ -107,6 +112,50 @@ def read_archive_scripts(path: Path) -> list[ScriptResource]:
     if kind == b"RIM ":
         return _read_rim_scripts(path, data)
     raise ValueError("unknown archive type")
+
+
+def read_key_scripts(game_dir: Path) -> list[ScriptResource]:
+    key_path = game_dir / "chitin.key"
+    if not key_path.is_file():
+        return []
+
+    data = key_path.read_bytes()
+    if len(data) < 24 or data[:8] != b"KEY V1  ":
+        raise ValueError("unsupported KEY")
+
+    bif_count, key_count, file_offset, key_offset = _unpack_from("<IIII", data, 8, "KEY header")
+    _require_range(data, file_offset, bif_count * 12, "KEY file table")
+    _require_range(data, key_offset, key_count * 22, "KEY resource table")
+
+    bif_names: list[str] = []
+    for index in range(bif_count):
+        at = file_offset + index * 12
+        _size, name_offset, name_size, _drives = _unpack_from("<IIHH", data, at, "KEY file entry")
+        _require_range(data, name_offset, name_size, "KEY file name")
+        bif_names.append(data[name_offset : name_offset + name_size].split(b"\x00", 1)[0].decode("ascii", "ignore"))
+
+    keys_by_bif: dict[int, dict[int, str]] = {}
+    for index in range(key_count):
+        at = key_offset + index * 22
+        resref_raw, res_type, res_id = _unpack_from("<16sHI", data, at, "KEY resource entry")
+        if res_type != NCS_RESOURCE_TYPE:
+            continue
+        bif_index = res_id >> 20
+        resref = resref_raw.split(b"\x00", 1)[0].decode("ascii", "ignore")
+        keys_by_bif.setdefault(bif_index, {})[res_id] = f"{resref}.ncs"
+
+    resources: list[ScriptResource] = []
+    for bif_index, names_by_id in sorted(keys_by_bif.items()):
+        if bif_index < 0 or bif_index >= len(bif_names):
+            continue
+        bif_path = game_dir / bif_names[bif_index]
+        if not bif_path.is_file():
+            continue
+        try:
+            resources.extend(_read_bif_scripts(bif_path, names_by_id))
+        except Exception as exc:
+            LOGGER.warning("skipped %s scripts: %s", bif_path, exc)
+    return resources
 
 
 def _read_erf(path: Path, data: bytes) -> list[DialogueResource]:
@@ -203,6 +252,36 @@ def _read_rim_scripts(path: Path, data: bytes) -> list[ScriptResource]:
             continue
         _require_range(data, offset, size, f"RIM resource {resref}")
         resources.append(_script_resource(path, f"{resref}.ncs", data[offset : offset + size]))
+    return resources
+
+
+def _read_bif_scripts(path: Path, names_by_id: dict[int, str]) -> list[ScriptResource]:
+    data = path.read_bytes()
+    if len(data) < 20 or data[:8] != b"BIFFV1  ":
+        raise ValueError("unsupported BIF")
+
+    variable_count, _fixed_count, variable_offset = _unpack_from("<III", data, 8, "BIF header")
+    _require_range(data, variable_offset, variable_count * 16, "BIF variable table")
+
+    resources: list[ScriptResource] = []
+    for index in range(variable_count):
+        at = variable_offset + index * 16
+        res_id, offset, size, res_type = _unpack_from("<IIII", data, at, "BIF variable entry")
+        if res_type != NCS_RESOURCE_TYPE:
+            continue
+        script_name = names_by_id.get(res_id)
+        if not script_name:
+            continue
+        _require_range(data, offset, size, f"BIF resource {script_name}")
+        resources.append(
+            ScriptResource(
+                source_path=path,
+                archive_name=path.name,
+                module_name="Base",
+                script_name=script_name,
+                data=data[offset : offset + size],
+            )
+        )
     return resources
 
 

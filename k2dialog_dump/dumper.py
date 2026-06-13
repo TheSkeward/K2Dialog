@@ -39,6 +39,8 @@ class StateEffectIndex:
     effects_by_state: dict[tuple[str, int], list[str]]
     dynamic_global_sets: dict[str, list[str]]
     constant_global_sets: dict[tuple[str, int], list[tuple[str, int]]]
+    contextual_script_effects: dict[tuple[str, str, int], list[str]] | None = None
+    current_module: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,11 +48,14 @@ class NcsInstruction:
     opcode: int
     qualifier: int
     args: tuple[object, ...]
+    offset: int = 0
+    end_offset: int = 0
 
 
 @dataclass
 class NcsStateAnalysis:
     global_reads: set[str]
+    state_conditions: set[tuple[str, int]]
     dynamic_global_sets: set[str]
     constant_global_sets: dict[int, list[tuple[str, int]]]
 
@@ -124,6 +129,7 @@ def render_dialogue(
     show_unresolved_checks: bool = False,
 ) -> str:
     state_effects = state_effects or StateEffectIndex({}, {}, {})
+    state_effects.current_module = (resource.module_name or "").lower()
     entries = _as_list(root.get("EntryList"))
     replies = _as_list(root.get("ReplyList"))
     speaker_hint = _conversation_speaker_hint(resource, root)
@@ -1369,6 +1375,12 @@ def _build_state_effect_index(
             if not effects:
                 continue
 
+            direct_states = _condition_states_from_link(start_link, item.resource.module_name)
+            if direct_states:
+                for key in direct_states:
+                    _extend_unique(effects_by_state.setdefault(key, []), effects)
+                continue
+
             for field, suffix in (("Active", ""), ("Active2", "b")):
                 script = _script_key(_plain_text(start_link.get(field)))
                 state_value = _condition_param(start_link, 1, suffix)
@@ -1395,6 +1407,8 @@ def _build_state_effect_index(
         dynamic_global_sets=dynamic_global_sets,
         constant_global_sets=constant_global_sets,
     )
+    _propagate_script_state_effects(effects_by_state, script_analysis)
+    _refresh_start_state_effects(parsed, tlk, state_effects, script_analysis)
     start_states = _start_condition_states(parsed, script_analysis)
     for script, global_name, value, effects in _forced_terminal_start_transitions(parsed, tlk, state_effects):
         for (candidate_script, _param_value), pairs in constant_global_sets.items():
@@ -1407,11 +1421,15 @@ def _build_state_effect_index(
                 if candidate_value == value or key not in start_states:
                     continue
                 _extend_unique(effects_by_state.setdefault(key, []), effects)
+    _propagate_script_state_effects(effects_by_state, script_analysis)
+    _refresh_start_state_effects(parsed, tlk, state_effects, script_analysis)
+    contextual_script_effects = _contextual_script_effects(scripts, effects_by_state)
 
     return StateEffectIndex(
         effects_by_state=effects_by_state,
         dynamic_global_sets=dynamic_global_sets,
         constant_global_sets=constant_global_sets,
+        contextual_script_effects=contextual_script_effects,
     )
 
 
@@ -1422,6 +1440,11 @@ def _start_condition_states(
     states: set[tuple[str, int]] = set()
     for item in parsed:
         for start_link in _as_list(item.root.get("StartingList")):
+            direct_states = _condition_states_from_link(start_link, item.resource.module_name)
+            if direct_states:
+                states.update(direct_states)
+                continue
+
             for field, suffix in (("Active", ""), ("Active2", "b")):
                 script = _script_key(_plain_text(start_link.get(field)))
                 value = _condition_param(start_link, 1, suffix)
@@ -1433,6 +1456,51 @@ def _start_condition_states(
                 for global_name in analysis.global_reads:
                     states.add((_state_key(global_name), value))
     return states
+
+
+def _refresh_start_state_effects(
+    parsed: list[ParsedDialogue],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex,
+    script_analysis: dict[str, NcsStateAnalysis],
+) -> None:
+    for _pass in range(2):
+        changed = False
+        for item in parsed:
+            entries = _as_list(item.root.get("EntryList"))
+            replies = _as_list(item.root.get("ReplyList"))
+            for start_link in _as_list(item.root.get("StartingList")):
+                entry_index = _index_from_link(start_link)
+                if entry_index is None or not (0 <= entry_index < len(entries)):
+                    continue
+
+                effects = _automatic_route_effect_lines(entry_index, entries, replies, tlk, state_effects)
+                if not effects:
+                    continue
+
+                states = _condition_states_from_link(start_link, item.resource.module_name)
+                if not states:
+                    states = []
+                    for field, suffix in (("Active", ""), ("Active2", "b")):
+                        script = _script_key(_plain_text(start_link.get(field)))
+                        value = _condition_param(start_link, 1, suffix)
+                        if not script or value is None:
+                            continue
+                        analysis = script_analysis.get(script)
+                        if analysis is None:
+                            continue
+                        for state_name in analysis.global_reads:
+                            states.append((_state_key(state_name), value))
+
+                for state in states:
+                    before = len(state_effects.effects_by_state.setdefault(state, []))
+                    _extend_unique(state_effects.effects_by_state[state], effects)
+                    if len(state_effects.effects_by_state[state]) != before:
+                        changed = True
+        if changed:
+            _propagate_script_state_effects(state_effects.effects_by_state, script_analysis)
+        else:
+            break
 
 
 def _forced_terminal_start_transitions(
@@ -1499,53 +1567,117 @@ def _script_state_analyses(scripts: list[ScriptResource]) -> dict[str, NcsStateA
         if not script:
             continue
         try:
-            analysis = _analyze_ncs_state(resource.data)
+            analysis = _analyze_ncs_state(resource.data, resource.module_name)
         except ValueError:
             continue
         if not analysis.global_reads and not analysis.dynamic_global_sets and not analysis.constant_global_sets:
             continue
 
-        existing = analyses.setdefault(script, NcsStateAnalysis(set(), set(), {}))
+        existing = analyses.setdefault(script, NcsStateAnalysis(set(), set(), set(), {}))
         existing.global_reads.update(analysis.global_reads)
+        existing.state_conditions.update(analysis.state_conditions)
         existing.dynamic_global_sets.update(analysis.dynamic_global_sets)
         for param_value, pairs in analysis.constant_global_sets.items():
             _extend_unique(existing.constant_global_sets.setdefault(param_value, []), pairs)
     return analyses
 
 
-def _analyze_ncs_state(data: bytes) -> NcsStateAnalysis:
+def _analyze_ncs_state(data: bytes, module_name: str | None = None) -> NcsStateAnalysis:
     instructions = _read_ncs_instructions(data)
-    analysis = NcsStateAnalysis(set(), set(), {})
+    analysis = NcsStateAnalysis(set(), set(), set(), {})
+    branch_targets = _script_param_branch_targets(instructions)
     current_param: int | None = None
 
     for index, instruction in enumerate(instructions):
-        branch_param = _script_param_branch_value(instructions, index)
-        if branch_param is not None:
-            current_param = branch_param
+        if index in branch_targets:
+            current_param = branch_targets[index]
 
         if _is_action(instruction, 580):
             global_name, _string_index = _previous_const_string(instructions, index)
             if global_name:
-                analysis.global_reads.add(global_name)
+                state = _global_number_state(global_name)
+                analysis.global_reads.add(state)
+                value = _following_equality_value(instructions, index)
+                if value is not None:
+                    analysis.state_conditions.add((state, value))
             continue
 
-        if not _is_action(instruction, 581):
+        if _is_action(instruction, 578):
+            global_name, _string_index = _previous_const_string(instructions, index)
+            if global_name:
+                state = _global_boolean_state(global_name)
+                analysis.global_reads.add(state)
+                value = _following_equality_value(instructions, index)
+                if value is not None:
+                    analysis.state_conditions.add((state, 1 if value else 0))
             continue
 
-        global_name, string_index = _previous_const_string(instructions, index)
-        if not global_name or string_index is None:
+        if _is_action(instruction, 679):
+            slot = _previous_const_int(instructions, index)
+            if slot is not None:
+                state = _local_boolean_state(slot, module_name)
+                analysis.global_reads.add(state)
+                value = _following_equality_value(instructions, index)
+                if value is not None:
+                    analysis.state_conditions.add((state, 1 if value else 0))
             continue
 
-        value_instruction = _previous_instruction(instructions, string_index)
-        if value_instruction is None:
+        if _is_action(instruction, 581):
+            global_name, string_index = _previous_const_string(instructions, index)
+            if not global_name or string_index is None:
+                continue
+
+            value_instruction = _previous_instruction(instructions, string_index)
+            if value_instruction is None:
+                continue
+
+            state = _global_number_state(global_name)
+            if _is_const_int(value_instruction):
+                value = int(value_instruction.args[0])
+                param_value = current_param if current_param is not None else 0
+                analysis.constant_global_sets.setdefault(param_value, []).append((state, value))
+            elif _is_stack_copy(value_instruction):
+                analysis.dynamic_global_sets.add(state)
             continue
 
-        if _is_const_int(value_instruction):
-            value = int(value_instruction.args[0])
+        if _is_action(instruction, 579):
+            global_name, string_index = _previous_const_string(instructions, index)
+            if not global_name or string_index is None:
+                continue
+
+            value_instruction = _previous_instruction(instructions, string_index)
+            if value_instruction is None:
+                continue
+
+            state = _global_boolean_state(global_name)
+            if _is_const_int(value_instruction):
+                value = 1 if int(value_instruction.args[0]) else 0
+                param_value = current_param if current_param is not None else 0
+                analysis.constant_global_sets.setdefault(param_value, []).append((state, value))
+            elif _is_stack_copy(value_instruction):
+                analysis.dynamic_global_sets.add(state)
+            continue
+
+        if _is_action(instruction, 680):
+            local_set = _previous_local_set_values(instructions, index)
+            if local_set is None:
+                continue
+            slot, value = local_set
             param_value = current_param if current_param is not None else 0
-            analysis.constant_global_sets.setdefault(param_value, []).append((global_name, value))
-        elif _is_stack_copy(value_instruction):
-            analysis.dynamic_global_sets.add(global_name)
+            analysis.constant_global_sets.setdefault(param_value, []).append(
+                (_local_boolean_state(slot, module_name), 1 if value else 0)
+            )
+            continue
+
+        if _is_action(instruction, 682):
+            local_set = _previous_local_set_values(instructions, index)
+            if local_set is None:
+                continue
+            slot, value = local_set
+            param_value = current_param if current_param is not None else 0
+            analysis.constant_global_sets.setdefault(param_value, []).append(
+                (_local_number_state(slot, module_name), value)
+            )
 
     for param_value, pairs in list(analysis.constant_global_sets.items()):
         analysis.constant_global_sets[param_value] = list(dict.fromkeys(pairs))
@@ -1565,6 +1697,7 @@ def _read_ncs_instructions(data: bytes) -> list[NcsInstruction]:
         if position + 2 > limit:
             raise ValueError("truncated NCS instruction")
 
+        start_position = position
         opcode = data[position]
         qualifier = data[position + 1]
         position += 2
@@ -1623,7 +1756,7 @@ def _read_ncs_instructions(data: bytes) -> list[NcsInstruction]:
             args = (struct.unpack_from(">H", data, position)[0],)
             position += 2
 
-        instructions.append(NcsInstruction(opcode, qualifier, args))
+        instructions.append(NcsInstruction(opcode, qualifier, args, start_position, position))
 
     return instructions
 
@@ -1647,11 +1780,67 @@ def _script_param_branch_value(instructions: list[NcsInstruction], index: int) -
     return int(instructions[index - 2].args[0])
 
 
+def _script_param_branch_targets(instructions: list[NcsInstruction]) -> dict[int, int]:
+    targets: dict[int, int] = {}
+    offsets = {instruction.offset: index for index, instruction in enumerate(instructions)}
+    for index, instruction in enumerate(instructions):
+        if index < 3:
+            continue
+        if not (_is_jump_zero(instruction) or _is_jump_nonzero(instruction)):
+            continue
+        if not _is_stack_copy(instructions[index - 3]):
+            continue
+        if not _is_const_int(instructions[index - 2]):
+            continue
+        if not _is_int_equality(instructions[index - 1]):
+            continue
+
+        value = int(instructions[index - 2].args[0])
+        if _is_jump_nonzero(instruction) and instruction.args:
+            target = offsets.get(instruction.offset + int(instruction.args[0]))
+            if target is not None:
+                targets[target] = value
+        elif index + 1 < len(instructions):
+            targets[index + 1] = value
+    return targets
+
+
+def _following_equality_value(instructions: list[NcsInstruction], index: int) -> int | None:
+    if index + 2 >= len(instructions):
+        return None
+    if not _is_const_int(instructions[index + 1]):
+        return None
+    if not _is_int_equality(instructions[index + 2]):
+        return None
+    return int(instructions[index + 1].args[0])
+
+
 def _previous_const_string(instructions: list[NcsInstruction], index: int) -> tuple[str, int | None]:
     previous = _previous_instruction(instructions, index)
     if previous is None or previous.opcode != 0x04 or previous.qualifier != 0x05:
         return "", None
     return str(previous.args[0]), index - 1
+
+
+def _previous_const_int(instructions: list[NcsInstruction], index: int) -> int | None:
+    for previous in reversed(instructions[max(0, index - 6) : index]):
+        if _is_const_int(previous):
+            return int(previous.args[0])
+    return None
+
+
+def _previous_local_set_values(instructions: list[NcsInstruction], index: int) -> tuple[int, int] | None:
+    values: list[int] = []
+    for previous in reversed(instructions[max(0, index - 8) : index]):
+        if _is_const_int(previous):
+            values.append(int(previous.args[0]))
+            if len(values) == 2:
+                break
+    if len(values) < 2:
+        return None
+    slot = values[0]
+    value = values[1]
+    return slot, value
 
 
 def _previous_instruction(instructions: list[NcsInstruction], index: int) -> NcsInstruction | None:
@@ -1678,6 +1867,10 @@ def _is_jump_zero(instruction: NcsInstruction) -> bool:
     return instruction.opcode == 0x1F
 
 
+def _is_jump_nonzero(instruction: NcsInstruction) -> bool:
+    return instruction.opcode == 0x25
+
+
 def _state_transition_effect_lines(node: GffStruct, state_effects: StateEffectIndex) -> list[str]:
     effects: list[str] = []
     for _script, _global_name, _value, transition_effects in _state_transition_effect_details(node, state_effects):
@@ -1690,11 +1883,22 @@ def _state_transition_effect_details(
     state_effects: StateEffectIndex,
 ) -> list[tuple[str, str, int, list[str]]]:
     details: list[tuple[str, str, int, list[str]]] = []
+    for state_name, value in _direct_action_state_sets(node):
+        effects = state_effects.effects_by_state.get((_state_key(state_name), value), [])
+        if effects:
+            details.append(("", state_name, value, _merged_annotations(effects)))
+
     for script, params in _action_script_calls(node):
         script_key = _script_key(script)
         if not script_key:
             continue
         state_value = params[0] if params else 0
+        contextual_effects = (state_effects.contextual_script_effects or {}).get(
+            ((state_effects.current_module or "").lower(), script_key, state_value),
+            [],
+        )
+        if contextual_effects:
+            details.append((script_key, f"context:{script_key}", state_value, _merged_annotations(contextual_effects)))
 
         for global_name, value in state_effects.constant_global_sets.get((script_key, state_value), []):
             effects = state_effects.effects_by_state.get((_state_key(global_name), value), [])
@@ -1717,10 +1921,143 @@ def _state_key(global_name: str) -> str:
     return global_name.lower()
 
 
+def _global_number_state(name: str) -> str:
+    return f"global-number:{name.strip().lower()}"
+
+
+def _global_boolean_state(name: str) -> str:
+    return f"global-boolean:{name.strip().lower()}"
+
+
+def _local_boolean_state(slot: int, module_name: str | None = None) -> str:
+    return f"local-boolean:{(module_name or '').strip().lower()}:{slot}"
+
+
+def _local_number_state(slot: int, module_name: str | None = None) -> str:
+    return f"local-number:{(module_name or '').strip().lower()}:{slot}"
+
+
+def _condition_states_from_link(link: GffStruct, module_name: str | None) -> list[tuple[str, int]]:
+    states: list[tuple[str, int]] = []
+    for field, suffix, str_field in (("Active", "", "ParamStrA"), ("Active2", "b", "ParamStrB")):
+        script = _script_key(_plain_text(link.get(field)))
+        if not script:
+            continue
+        value = _condition_param(link, 1, suffix)
+        second_value = _condition_param(link, 2, suffix)
+        string_param = _plain_text(link.get(str_field))
+        state = _condition_state(script, value, second_value, string_param, module_name)
+        if state is not None and state not in states:
+            states.append(state)
+    return states
+
+
+def _condition_state(
+    script: str,
+    value: int | None,
+    second_value: int | None,
+    string_param: str,
+    module_name: str | None,
+) -> tuple[str, int] | None:
+    if value is None:
+        return None
+    if script in {"c_global_eq", "c_global_gt", "c_global_lt"} and string_param:
+        return (_global_number_state(string_param), value)
+    if script in {"c_glob_bool_set", "c_global_bool_set"} and string_param:
+        return (_global_boolean_state(string_param), 1)
+    if script in {"c_glob_bool_notset", "c_global_bool_notset"} and string_param:
+        return (_global_boolean_state(string_param), 0)
+    if script == "c_local_set":
+        return (_local_boolean_state(value, module_name), 1)
+    if script == "c_local_notset":
+        return (_local_boolean_state(value, module_name), 0)
+    if script == "c_localn_eq":
+        return (_local_number_state(value, module_name), second_value or 0)
+    return None
+
+
+def _direct_action_state_sets(node: GffStruct) -> list[tuple[str, int]]:
+    states: list[tuple[str, int]] = []
+    for script, suffix, str_field in (("Script", "", "ActionParamStrA"), ("Script2", "b", "ActionParamStrB")):
+        script_name = _script_key(_plain_text(node.get(script)))
+        if not script_name:
+            continue
+        value = _int_value(node.get(f"ActionParam1{suffix}"))
+        second_value = _int_value(node.get(f"ActionParam2{suffix}"))
+        string_param = _plain_text(node.get(str_field))
+        state: tuple[str, int] | None = None
+        if script_name == "a_global_set" and string_param and value is not None:
+            state = (_global_number_state(string_param), value)
+        elif script_name == "a_glob_bool_set" and string_param:
+            state = (_global_boolean_state(string_param), 1 if value else 0)
+        elif script_name == "a_local_set" and value is not None:
+            state = (_local_boolean_state(value), 1)
+        elif script_name == "a_local_reset" and value is not None:
+            state = (_local_boolean_state(value), 0)
+        elif script_name == "a_localn_set" and value is not None and second_value is not None:
+            state = (_local_number_state(value), second_value)
+        if state is not None and state not in states:
+            states.append(state)
+    return states
+
+
 def _extend_unique(items: list, additions: list) -> None:
     for item in additions:
         if item not in items:
             items.append(item)
+
+
+def _propagate_script_state_effects(
+    effects_by_state: dict[tuple[str, int], list[str]],
+    script_analysis: dict[str, NcsStateAnalysis],
+) -> None:
+    changed = True
+    while changed:
+        changed = False
+        for analysis in script_analysis.values():
+            if not analysis.state_conditions:
+                continue
+            downstream_effects: list[str] = []
+            for state_name, value in analysis.constant_global_sets.get(0, []):
+                _extend_unique(downstream_effects, effects_by_state.get((_state_key(state_name), value), []))
+            if not downstream_effects:
+                continue
+            for state in analysis.state_conditions:
+                before = len(effects_by_state.setdefault(state, []))
+                _extend_unique(effects_by_state[state], downstream_effects)
+                if len(effects_by_state[state]) != before:
+                    changed = True
+
+
+def _contextual_script_effects(
+    scripts: list[ScriptResource],
+    effects_by_state: dict[tuple[str, int], list[str]],
+) -> dict[tuple[str, str, int], list[str]]:
+    effects: dict[tuple[str, str, int], list[str]] = {}
+    available_scripts = {((resource.module_name or "").lower(), _script_key(resource.script_name)) for resource in scripts}
+
+    for resource in scripts:
+        module = (resource.module_name or "").lower()
+        script = _script_key(resource.script_name)
+        match = re.fullmatch(r"k_(?P<stem>.+?)_(?:damage|damaged|death|dead)", script)
+        if not match:
+            continue
+
+        action_script = f"a_{match.group('stem')}"
+        if (module, action_script) not in available_scripts:
+            continue
+
+        try:
+            analysis = _analyze_ncs_state(resource.data, resource.module_name)
+        except ValueError:
+            continue
+
+        script_effects: list[str] = []
+        for state_name, value in analysis.constant_global_sets.get(0, []):
+            _extend_unique(script_effects, effects_by_state.get((_state_key(state_name), value), []))
+        if script_effects:
+            effects[(module, action_script, 1)] = _merged_annotations(script_effects)
+    return effects
 
 
 def _effect_lines(node: GffStruct) -> list[str]:
