@@ -187,8 +187,6 @@ def render_dialogue(
             continue
         if _is_empty_transition_entry(entry, replies, tlk):
             continue
-        if _is_forced_terminal_entry(index, entries, replies, tlk, state_effects):
-            continue
         forced_path = _forced_reply_transcript_path_to_choices(
             index,
             entries,
@@ -247,6 +245,8 @@ def render_dialogue(
             lines.append("---")
             lines.append("")
             rendered_any = True
+            continue
+        if _is_forced_terminal_entry(index, entries, replies, tlk, state_effects):
             continue
         chain = _linear_continue_chain(index, entries, replies, tlk, speaker_hint)
         if len(chain) >= 2:
