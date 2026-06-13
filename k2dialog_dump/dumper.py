@@ -174,7 +174,7 @@ def render_dialogue(
                     for _label, path in branch_paths:
                         skip_entries.update(path)
                 else:
-                    block = _render_transcript_chain(transcript_chain, entries, tlk, speaker_hint)
+                    block = _render_transcript_chain(transcript_chain, entries, replies, tlk, speaker_hint)
                     if _block_seen(block, seen_blocks):
                         skip_entries.update(transcript_chain)
                         continue
@@ -396,7 +396,7 @@ def _forced_reply_transcript_path_to_choices(
         seen_entries.add(current)
         entry_indices.append(current)
         entry = entries[current]
-        _append_entry_turn(turns, entry, tlk, speaker_hint)
+        _append_entry_turn(turns, current, entries, replies, tlk, speaker_hint)
 
         hidden_next = _trivial_continue_next(entry, replies, tlk)
         if hidden_next is not None:
@@ -443,10 +443,23 @@ def _forced_reply_transcript_path_to_choices(
     return None
 
 
-def _append_entry_turn(turns: list[tuple[str, str]], entry: GffStruct, tlk: TlkTable, speaker_hint: str) -> None:
+def _append_entry_turn(
+    turns: list[tuple[str, str]],
+    entry_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    speaker_hint: str,
+) -> None:
+    entry = entries[entry_index]
     text, _entry_notes = _split_designer_notes(_resolve_text(entry, tlk))
     if text:
-        turns.append((_entry_speaker(entry, speaker_hint), text))
+        turns.append(
+            (
+                _entry_speaker(entry, speaker_hint),
+                _entry_text_with_unlinked_effects(entry_index, text, entries, replies),
+            )
+        )
 
 
 def _auto_next_entry_labels(entry: GffStruct, replies: list[GffStruct], tlk: TlkTable) -> list[tuple[str, int]]:
@@ -513,6 +526,7 @@ def _condition_label(script: str) -> str:
 def _render_transcript_chain(
     chain: list[int],
     entries: list[GffStruct],
+    replies: list[GffStruct],
     tlk: TlkTable,
     speaker_hint: str,
 ) -> list[str]:
@@ -523,6 +537,7 @@ def _render_transcript_chain(
         speaker = _entry_speaker(entries[index], speaker_hint)
         text, _entry_notes = _split_designer_notes(_resolve_text(entries[index], tlk))
         if text:
+            text = _entry_text_with_unlinked_effects(index, text, entries, replies)
             if turns and turns[-1][0] == speaker:
                 turns[-1][1].append(text)
             else:
@@ -551,7 +566,7 @@ def _render_transcript_chain_with_choices(
     *,
     show_unresolved_checks: bool = False,
 ) -> list[str]:
-    lines = _render_transcript_chain(chain, entries, tlk, speaker_hint)
+    lines = _render_transcript_chain(chain, entries, replies, tlk, speaker_hint)
     reply_lines = _reply_lines(
         entries[chain[-1]],
         entries,
@@ -607,7 +622,7 @@ def _render_transcript_paths_with_choices(
 ) -> list[str]:
     heading_indices = _combined_path_indices(paths)
     common_path = _common_path_prefix([path for _label, path in paths])
-    common_turns = _chain_turns(common_path, entries, tlk, speaker_hint)
+    common_turns = _chain_turns(common_path, entries, replies, tlk, speaker_hint)
     lines = [_entry_chain_heading(heading_indices), ""]
 
     rendered_variants: list[tuple[str, list[str]]] = []
@@ -615,7 +630,7 @@ def _render_transcript_paths_with_choices(
     for label, path in paths:
         variant_path = path[len(common_path) :]
         variant_lines: list[str] = []
-        for speaker, parts in _merge_turns(common_turns + _chain_turns(variant_path, entries, tlk, speaker_hint)):
+        for speaker, parts in _merge_turns(common_turns + _chain_turns(variant_path, entries, replies, tlk, speaker_hint)):
             text = _paragraph(" ".join(parts))
             if speaker:
                 variant_lines.append(f"**{_md_escape(speaker)}:** {text}")
@@ -714,6 +729,7 @@ def _entry_path_part(start: int, end: int) -> str:
 def _chain_turns(
     chain: list[int],
     entries: list[GffStruct],
+    replies: list[GffStruct],
     tlk: TlkTable,
     speaker_hint: str,
 ) -> list[tuple[str, list[str]]]:
@@ -723,7 +739,7 @@ def _chain_turns(
         text, _entry_notes = _split_designer_notes(_resolve_text(entries[index], tlk))
         if not text:
             continue
-        turns.append((speaker, [text]))
+        turns.append((speaker, [_entry_text_with_unlinked_effects(index, text, entries, replies)]))
     return _merge_turns(turns)
 
 
@@ -785,7 +801,7 @@ def _render_entry(
     lines = [f"## Entry {index}", ""]
     speaker = _entry_speaker(entry, speaker_hint)
     text, notes = _split_designer_notes(_resolve_text(entry, tlk))
-    line_text = _display_text(text or "[no text]", speaker)
+    line_text = _display_text(_entry_text_with_unlinked_effects(index, text or "[no text]", entries, replies), speaker)
     if speaker:
         lines.extend(_speaker_text_lines(speaker, line_text))
     else:
@@ -905,6 +921,29 @@ def _merged_annotations(annotations: list[str]) -> list[str]:
             merged[position] = f"{label} {amount:+d}"
 
     return [annotation for annotation in merged if annotation]
+
+
+def _entry_text_with_unlinked_effects(
+    entry_index: int,
+    text: str,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+) -> str:
+    if _entry_has_inbound_link(entry_index, replies):
+        return text
+
+    effects = _merged_annotations(_effect_lines(entries[entry_index]))
+    if not effects:
+        return text
+    return f"{text} [{'; '.join(effects)}]"
+
+
+def _entry_has_inbound_link(entry_index: int, replies: list[GffStruct]) -> bool:
+    for reply in replies:
+        for link in _as_list(reply.get("EntriesList")):
+            if _index_from_link(link) == entry_index:
+                return True
+    return False
 
 
 def _routed_entry_check_lines(
