@@ -7,7 +7,14 @@ import re
 import shutil
 import struct
 
-from .archives import DialogueResource, ScriptResource, find_dialogue_resources, find_script_resources
+from .archives import (
+    DialogueResource,
+    NameResource,
+    ScriptResource,
+    find_dialogue_resources,
+    find_name_resources,
+    find_script_resources,
+)
 from .gff import GffStruct, read_gff
 from .tlk import TlkTable, find_dialog_tlk
 
@@ -44,6 +51,12 @@ class StateEffectIndex:
     current_module: str | None = None
     route_effect_cache: dict[tuple[int, int, bool, tuple[int, ...]], list[str]] | None = None
     common_reply_effect_cache: dict[tuple[int, int, tuple[int, ...]], list[str]] | None = None
+
+
+@dataclass
+class SpeakerNameIndex:
+    names_by_module_key: dict[tuple[str, str], list[str]]
+    names_by_key: dict[str, list[str]]
 
 
 @dataclass(frozen=True)
@@ -104,6 +117,12 @@ def dump_game(options: DumpOptions) -> list[DumpedDialogue]:
         LOGGER.warning("failed to inspect compiled scripts for deferred effects: %s", exc)
         state_effects = StateEffectIndex({}, {}, {})
 
+    try:
+        speaker_names = _build_speaker_name_index(find_name_resources(game_dir), tlk)
+    except Exception as exc:
+        LOGGER.warning("failed to inspect creature/placeable names: %s", exc)
+        speaker_names = SpeakerNameIndex({}, {})
+
     dumped: list[DumpedDialogue] = []
     for item in parsed:
         try:
@@ -112,6 +131,7 @@ def dump_game(options: DumpOptions) -> list[DumpedDialogue]:
                 item.root,
                 tlk,
                 state_effects=state_effects,
+                speaker_names=speaker_names,
                 show_unresolved_checks=options.show_unresolved_checks,
             )
             if not markdown.strip():
@@ -136,6 +156,7 @@ def render_dialogue(
     tlk: TlkTable,
     *,
     state_effects: StateEffectIndex | None = None,
+    speaker_names: SpeakerNameIndex | None = None,
     show_unresolved_checks: bool = False,
 ) -> str:
     state_effects = state_effects or StateEffectIndex({}, {}, {})
@@ -144,7 +165,8 @@ def render_dialogue(
     state_effects.common_reply_effect_cache = {}
     entries = _as_list(root.get("EntryList"))
     replies = _as_list(root.get("ReplyList"))
-    speaker_hint = _conversation_speaker_hint(resource, root)
+    _resolve_entry_speaker_labels(entries, resource, speaker_names)
+    speaker_hint = _conversation_speaker_hint(resource, root, speaker_names)
     if _is_low_value_dialogue(resource, entries, replies, tlk):
         return ""
 
@@ -3178,9 +3200,186 @@ def _entry_speaker(entry: GffStruct, speaker_hint: str) -> str:
     return speaker_hint
 
 
-def _conversation_speaker_hint(resource: DialogueResource, root: GffStruct) -> str:
+def _resolve_entry_speaker_labels(
+    entries: list[GffStruct],
+    resource: DialogueResource,
+    speaker_names: SpeakerNameIndex | None,
+) -> None:
+    if speaker_names is None:
+        return
+    for entry in entries:
+        speaker = _plain_text(entry.get("Speaker"))
+        resolved = _lookup_speaker_name(speaker, resource, speaker_names)
+        if resolved:
+            entry.fields["Speaker"] = resolved
+
+
+def _build_speaker_name_index(resources: list[NameResource], tlk: TlkTable) -> SpeakerNameIndex:
+    by_module: dict[tuple[str, str], list[str]] = {}
+    by_key: dict[str, list[str]] = {}
+
+    for resource in resources:
+        try:
+            root = read_gff(resource.data)
+        except Exception as exc:
+            LOGGER.warning("failed to parse %s::%s: %s", resource.source_path, resource.resource_name, exc)
+            continue
+
+        name = _resource_speaker_name(root, tlk)
+        if not name:
+            continue
+
+        module = (resource.module_name or "").lower()
+        keys = _speaker_lookup_keys(Path(resource.resource_name).stem)
+        for field in ("TemplateResRef", "Tag", "Conversation", "Dialog", "Dialogue"):
+            keys.extend(_speaker_lookup_keys(_plain_text(root.get(field))))
+
+        for key in dict.fromkeys(keys):
+            _add_speaker_name(by_key, key, name)
+            if module:
+                _add_speaker_name(by_module, (module, key), name)
+
+    return SpeakerNameIndex(names_by_module_key=by_module, names_by_key=by_key)
+
+
+def _resource_speaker_name(root: GffStruct, tlk: TlkTable) -> str:
+    first = _resolve_locstring(root.get("FirstName"), tlk)
+    last = _resolve_locstring(root.get("LastName"), tlk)
+    combined = " ".join(part for part in (first, last) if part).strip()
+    if combined:
+        return _clean_resource_speaker_name(combined)
+
+    for field in ("LocalizedName", "LocName"):
+        name = _resolve_locstring(root.get(field), tlk)
+        if name:
+            return _clean_resource_speaker_name(name)
+    return ""
+
+
+def _resolve_locstring(value: object, tlk: TlkTable) -> str:
+    if isinstance(value, dict):
+        strref = value.get("strref", -1)
+        if isinstance(strref, int) and strref >= 0:
+            resolved = tlk.get(strref)
+            if resolved:
+                return resolved
+        for substring in value.get("substrings") or []:
+            text = substring.get("text", "")
+            if text:
+                return text
+    if isinstance(value, int):
+        return tlk.get(value) if value >= 0 else ""
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _clean_resource_speaker_name(text: str) -> str:
+    text, _notes = _split_designer_notes(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text or text.lower().startswith("bad strref"):
+        return ""
+    canonical = _canonical_speaker_name(text)
+    if canonical:
+        return canonical
+    if "_" in text or text.islower() or re.fullmatch(r"[A-Za-z0-9_-]+", text):
+        return _pretty_label(text)
+    return text
+
+
+def _canonical_speaker_name(text: str) -> str:
+    compact = re.sub(r"[^a-z0-9]+", "", text.lower())
+    known = {
+        "3cfd": "3C-FD",
+        "1b8d": "1B-8D",
+        "b4d4": "B-4D4",
+        "b5d8": "B-5D8",
+        "c7e3": "C7-E3",
+        "c9t9": "C-9T-9",
+        "g0t0": "G0-T0",
+        "hk47": "HK-47",
+        "hk50": "HK-50",
+        "it31": "IT-31",
+        "p1dk": "P-1DK",
+        "s4c8": "S4-C8",
+        "t3m4": "T3-M4",
+        "t1n1": "T1-N1",
+        "tt32": "TT-32",
+    }
+    return known.get(compact, "")
+
+
+def _speaker_lookup_keys(value: str) -> list[str]:
+    value = value.strip()
+    if not value:
+        return []
+    lowered = value.lower()
+    cleaned = _clean_speaker_tag(value).lower()
+    stripped = re.sub(r"^\d{3,}", "", cleaned).strip("_- ")
+    compact = re.sub(r"[^a-z0-9]+", "", lowered)
+    stripped_compact = re.sub(r"[^a-z0-9]+", "", stripped)
+    return [
+        key
+        for key in dict.fromkeys((lowered, cleaned, stripped, compact, stripped_compact))
+        if key
+    ]
+
+
+def _add_speaker_name(mapping: dict[object, list[str]], key: object, name: str) -> None:
+    if not name:
+        return
+    bucket = mapping.setdefault(key, [])
+    if name not in bucket:
+        bucket.append(name)
+
+
+def _lookup_speaker_name(
+    value: str,
+    resource: DialogueResource,
+    speaker_names: SpeakerNameIndex | None,
+) -> str:
+    if not value or speaker_names is None:
+        return ""
+
+    module = (resource.module_name or "").lower()
+    module_candidates = [candidate for candidate in ("override", module) if candidate]
+    keys = _speaker_lookup_keys(value)
+
+    for key in keys:
+        for module_key in module_candidates:
+            resolved = _unique_speaker_name(speaker_names.names_by_module_key.get((module_key, key), []))
+            if resolved:
+                return resolved
+
+    for key in keys:
+        resolved = _unique_speaker_name(speaker_names.names_by_key.get(key, []))
+        if resolved:
+            return resolved
+    return ""
+
+
+def _unique_speaker_name(names: list[str]) -> str:
+    cleaned = [_clean_resource_speaker_name(name) for name in names]
+    cleaned = [name for name in cleaned if name]
+    if not cleaned:
+        return ""
+
+    by_lower: dict[str, str] = {}
+    for name in cleaned:
+        by_lower.setdefault(name.lower(), name)
+    return next(iter(by_lower.values())) if len(by_lower) == 1 else ""
+
+
+def _conversation_speaker_hint(
+    resource: DialogueResource,
+    root: GffStruct,
+    speaker_names: SpeakerNameIndex | None = None,
+) -> str:
     vo_id = _plain_text(root.get("VO_ID"))
     if vo_id:
+        resolved = _lookup_speaker_name(vo_id, resource, speaker_names)
+        if resolved:
+            return resolved
         return _pretty_label(vo_id)
 
     stem = Path(resource.dlg_name).stem.lower()
@@ -3203,6 +3402,9 @@ def _conversation_speaker_hint(resource: DialogueResource, root: GffStruct) -> s
         return "Atton"
     if stem in labels:
         return labels[stem]
+    resolved = _lookup_speaker_name(stem, resource, speaker_names)
+    if resolved:
+        return resolved
     return _speaker_hint_from_stem(stem)
 
 
@@ -3258,6 +3460,7 @@ def _speaker_hint_from_stem(stem: str) -> str:
         "zez": "Zez-Kai Ell",
         "sion": "Sion",
         "atris": "Atris",
+        "atrend3": "Atris",
         "talia": "Queen Talia",
         "vaklu": "General Vaklu",
         "tobin": "Colonel Tobin",
@@ -3328,6 +3531,9 @@ def _is_terminal_label(label: str) -> bool:
 
 def _pretty_label(value: str) -> str:
     normalized = value.strip()
+    canonical = _canonical_speaker_name(normalized)
+    if canonical:
+        return canonical
     known = {
         "909sion": "Sion",
         "atton": "Atton",
@@ -3337,9 +3543,13 @@ def _pretty_label(value: str) -> str:
         "atriscut": "Atris",
         "b4d4": "B-4D4",
         "b5d8": "B-5D8",
+        "b2term": "Droid Maintenance Chamber Control",
+        "benc-99": "Workbench",
+        "benc99": "Workbench",
         "baodur": "Bao-Dur",
         "bao_dur": "Bao-Dur",
         "bh_rodian": "Rodian Bounty Hunter",
+        "222tel": "Shuttle",
         "col_tobin": "Colonel Tobin",
         "comchannel": "Comlink",
         "darthnihilus": "Darth Nihilus",
@@ -3386,6 +3596,8 @@ def _pretty_label(value: str) -> str:
         "ond_soldier_ri": "Onderon Soldier",
         "psoldier": "Palace Soldier",
         "recapt": "Republic Captain",
+        "ref-2": "Refugee",
+        "ref2": "Refugee",
         "redeclipsecrew-1": "Red Eclipse Crew",
         "redeclipsecrew-2": "Red Eclipse Crew",
         "redeclipsecrew-3": "Red Eclipse Crew",
@@ -3400,9 +3612,13 @@ def _pretty_label(value: str) -> str:
         "sister2cut": "Handmaiden Sister",
         "sister2wind": "Handmaiden Sister",
         "talia": "Queen Talia",
+        "tempin-0001": "Refugee",
+        "tempin0001": "Refugee",
         "thgd": "Exchange Thug",
         "t1n1": "T1-N1",
         "tobin": "Colonel Tobin",
+        "trma-2": "Airlock 2 Terminal",
+        "trma2": "Airlock 2 Terminal",
         "twiholo": "Twi'lek",
         "twilek_servant": "Twi'lek Servant",
         "twinsun-1": "Twin Sun",
