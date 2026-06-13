@@ -5,8 +5,9 @@ import logging
 from pathlib import Path
 import re
 import shutil
+import struct
 
-from .archives import DialogueResource, find_dialogue_resources
+from .archives import DialogueResource, ScriptResource, find_dialogue_resources, find_script_resources
 from .gff import GffStruct, read_gff
 from .tlk import TlkTable, find_dialog_tlk
 
@@ -25,6 +26,33 @@ class DumpOptions:
 class DumpedDialogue:
     resource: DialogueResource
     markdown: str
+
+
+@dataclass
+class ParsedDialogue:
+    resource: DialogueResource
+    root: GffStruct
+
+
+@dataclass
+class StateEffectIndex:
+    effects_by_state: dict[tuple[str, int], list[str]]
+    dynamic_global_sets: dict[str, list[str]]
+    constant_global_sets: dict[tuple[str, int], list[tuple[str, int]]]
+
+
+@dataclass(frozen=True)
+class NcsInstruction:
+    opcode: int
+    qualifier: int
+    args: tuple[object, ...]
+
+
+@dataclass
+class NcsStateAnalysis:
+    global_reads: set[str]
+    dynamic_global_sets: set[str]
+    constant_global_sets: dict[int, list[tuple[str, int]]]
 
 
 LOGGER = logging.getLogger(__name__)
@@ -48,16 +76,34 @@ def dump_game(options: DumpOptions) -> list[DumpedDialogue]:
     tlk = TlkTable.read(find_dialog_tlk(game_dir))
     resources = find_dialogue_resources(game_dir)
 
-    dumped: list[DumpedDialogue] = []
+    parsed: list[ParsedDialogue] = []
     for resource in resources:
         try:
-            root = read_gff(resource.data)
-            markdown = render_dialogue(resource, root, tlk, show_unresolved_checks=options.show_unresolved_checks)
-            if not markdown.strip():
-                continue
-            dumped.append(DumpedDialogue(resource=resource, markdown=markdown))
+            parsed.append(ParsedDialogue(resource=resource, root=read_gff(resource.data)))
         except Exception as exc:
             LOGGER.warning("failed to parse %s::%s: %s", resource.source_path, resource.dlg_name, exc)
+
+    try:
+        state_effects = _build_state_effect_index(parsed, find_script_resources(game_dir), tlk)
+    except Exception as exc:
+        LOGGER.warning("failed to inspect compiled scripts for deferred effects: %s", exc)
+        state_effects = StateEffectIndex({}, {}, {})
+
+    dumped: list[DumpedDialogue] = []
+    for item in parsed:
+        try:
+            markdown = render_dialogue(
+                item.resource,
+                item.root,
+                tlk,
+                state_effects=state_effects,
+                show_unresolved_checks=options.show_unresolved_checks,
+            )
+            if not markdown.strip():
+                continue
+            dumped.append(DumpedDialogue(resource=item.resource, markdown=markdown))
+        except Exception as exc:
+            LOGGER.warning("failed to render %s::%s: %s", item.resource.source_path, item.resource.dlg_name, exc)
 
     _prepare_output_dir(out_dir)
     if options.single_file:
@@ -74,8 +120,10 @@ def render_dialogue(
     root: GffStruct,
     tlk: TlkTable,
     *,
+    state_effects: StateEffectIndex | None = None,
     show_unresolved_checks: bool = False,
 ) -> str:
+    state_effects = state_effects or StateEffectIndex({}, {}, {})
     entries = _as_list(root.get("EntryList"))
     replies = _as_list(root.get("ReplyList"))
     speaker_hint = _conversation_speaker_hint(resource, root)
@@ -99,7 +147,14 @@ def render_dialogue(
             continue
         if _is_empty_transition_entry(entry, replies, tlk):
             continue
-        forced_path = _forced_reply_transcript_path_to_choices(index, entries, replies, tlk, speaker_hint)
+        forced_path = _forced_reply_transcript_path_to_choices(
+            index,
+            entries,
+            replies,
+            tlk,
+            speaker_hint,
+            state_effects,
+        )
         if forced_path:
             block = _render_forced_reply_transcript_path(
                 forced_path,
@@ -107,6 +162,7 @@ def render_dialogue(
                 replies,
                 tlk,
                 speaker_hint,
+                state_effects,
                 show_unresolved_checks=show_unresolved_checks,
             )
             if _block_seen(block, seen_blocks):
@@ -133,6 +189,7 @@ def render_dialogue(
                     replies,
                     tlk,
                     speaker_hint,
+                    state_effects,
                     show_unresolved_checks=show_unresolved_checks,
                 )
                 if _block_seen(block, seen_blocks):
@@ -162,6 +219,7 @@ def render_dialogue(
                         replies,
                         tlk,
                         speaker_hint,
+                        state_effects,
                         show_unresolved_checks=show_unresolved_checks,
                     )
                     if _block_seen(block, seen_blocks):
@@ -195,6 +253,7 @@ def render_dialogue(
                     replies,
                     tlk,
                     speaker_hint,
+                    state_effects,
                     show_unresolved_checks=show_unresolved_checks,
                 )
             else:
@@ -204,6 +263,7 @@ def render_dialogue(
                     replies,
                     tlk,
                     speaker_hint,
+                    state_effects,
                     show_unresolved_checks=show_unresolved_checks,
                 )
             if _block_seen(block, seen_blocks):
@@ -223,6 +283,7 @@ def render_dialogue(
             replies,
             tlk,
             speaker_hint,
+            state_effects,
             show_unresolved_checks=show_unresolved_checks,
         )
         if _block_seen(block, seen_blocks):
@@ -385,6 +446,7 @@ def _forced_reply_transcript_path_to_choices(
     replies: list[GffStruct],
     tlk: TlkTable,
     speaker_hint: str,
+    state_effects: StateEffectIndex,
 ) -> tuple[list[int], list[tuple[str, str]], int] | None:
     entry_indices: list[int] = []
     turns: list[tuple[str, str]] = []
@@ -403,7 +465,7 @@ def _forced_reply_transcript_path_to_choices(
             current = hidden_next
             continue
 
-        reply_lines = _reply_lines(entry, entries, replies, tlk)
+        reply_lines = _reply_lines(entry, entries, replies, tlk, state_effects)
         if len(reply_lines) > 1:
             if forced_reply_count:
                 return entry_indices, turns, current
@@ -420,7 +482,7 @@ def _forced_reply_transcript_path_to_choices(
             return None
         reply = replies[reply_index]
         reply_text, _reply_notes = _split_designer_notes(_resolve_text(reply, tlk))
-        if _reply_check_lines(reply, reply_text, entries, replies, tlk):
+        if _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects):
             return None
 
         next_links = _as_list(reply.get("EntriesList"))
@@ -433,7 +495,7 @@ def _forced_reply_transcript_path_to_choices(
         if next_index is None:
             return None
 
-        turn_text = _reply_line_text(link, entries, replies, tlk)
+        turn_text = _reply_line_text(link, entries, replies, tlk, state_effects)
         if not turn_text:
             return None
         turns.append(("Exile", turn_text))
@@ -457,7 +519,7 @@ def _append_entry_turn(
         turns.append(
             (
                 _entry_speaker(entry, speaker_hint),
-                _entry_text_with_unlinked_effects(entry_index, text, entries, replies),
+                text,
             )
         )
 
@@ -537,7 +599,6 @@ def _render_transcript_chain(
         speaker = _entry_speaker(entries[index], speaker_hint)
         text, _entry_notes = _split_designer_notes(_resolve_text(entries[index], tlk))
         if text:
-            text = _entry_text_with_unlinked_effects(index, text, entries, replies)
             if turns and turns[-1][0] == speaker:
                 turns[-1][1].append(text)
             else:
@@ -563,6 +624,7 @@ def _render_transcript_chain_with_choices(
     replies: list[GffStruct],
     tlk: TlkTable,
     speaker_hint: str,
+    state_effects: StateEffectIndex,
     *,
     show_unresolved_checks: bool = False,
 ) -> list[str]:
@@ -572,6 +634,7 @@ def _render_transcript_chain_with_choices(
         entries,
         replies,
         tlk,
+        state_effects,
         show_unresolved_checks=show_unresolved_checks,
     )
     if reply_lines:
@@ -586,6 +649,7 @@ def _render_forced_reply_transcript_path(
     replies: list[GffStruct],
     tlk: TlkTable,
     speaker_hint: str,
+    state_effects: StateEffectIndex,
     *,
     show_unresolved_checks: bool = False,
 ) -> list[str]:
@@ -603,6 +667,7 @@ def _render_forced_reply_transcript_path(
         entries,
         replies,
         tlk,
+        state_effects,
         show_unresolved_checks=show_unresolved_checks,
     )
     if reply_lines:
@@ -617,6 +682,7 @@ def _render_transcript_paths_with_choices(
     replies: list[GffStruct],
     tlk: TlkTable,
     speaker_hint: str,
+    state_effects: StateEffectIndex,
     *,
     show_unresolved_checks: bool = False,
 ) -> list[str]:
@@ -642,6 +708,7 @@ def _render_transcript_paths_with_choices(
             entries,
             replies,
             tlk,
+            state_effects,
             show_unresolved_checks=show_unresolved_checks,
         )
         if reply_lines:
@@ -739,7 +806,7 @@ def _chain_turns(
         text, _entry_notes = _split_designer_notes(_resolve_text(entries[index], tlk))
         if not text:
             continue
-        turns.append((speaker, [_entry_text_with_unlinked_effects(index, text, entries, replies)]))
+        turns.append((speaker, [text]))
     return _merge_turns(turns)
 
 
@@ -795,19 +862,27 @@ def _render_entry(
     replies: list[GffStruct],
     tlk: TlkTable,
     speaker_hint: str,
+    state_effects: StateEffectIndex,
     *,
     show_unresolved_checks: bool = False,
 ) -> list[str]:
     lines = [f"## Entry {index}", ""]
     speaker = _entry_speaker(entry, speaker_hint)
     text, notes = _split_designer_notes(_resolve_text(entry, tlk))
-    line_text = _display_text(_entry_text_with_unlinked_effects(index, text or "[no text]", entries, replies), speaker)
+    line_text = _display_text(text or "[no text]", speaker)
     if speaker:
         lines.extend(_speaker_text_lines(speaker, line_text))
     else:
         lines.append(line_text)
 
-    reply_lines = _reply_lines(entry, entries, replies, tlk, show_unresolved_checks=show_unresolved_checks)
+    reply_lines = _reply_lines(
+        entry,
+        entries,
+        replies,
+        tlk,
+        state_effects,
+        show_unresolved_checks=show_unresolved_checks,
+    )
     if reply_lines:
         lines.append("")
         lines.extend(reply_lines)
@@ -819,6 +894,7 @@ def _reply_lines(
     entries: list[GffStruct],
     replies: list[GffStruct],
     tlk: TlkTable,
+    state_effects: StateEffectIndex | None = None,
     *,
     show_unresolved_checks: bool = False,
 ) -> list[str]:
@@ -836,6 +912,7 @@ def _reply_lines(
             entries,
             replies,
             tlk,
+            state_effects,
             show_unresolved_checks=show_unresolved_checks,
         )
         if line:
@@ -848,9 +925,11 @@ def _reply_line_text(
     entries: list[GffStruct],
     replies: list[GffStruct],
     tlk: TlkTable,
+    state_effects: StateEffectIndex | None = None,
     *,
     show_unresolved_checks: bool = False,
 ) -> str:
+    state_effects = state_effects or StateEffectIndex({}, {}, {})
     reply_index = _index_from_link(link)
     if reply_index is None:
         return ""
@@ -871,18 +950,18 @@ def _reply_line_text(
     check_lines: list[str] = []
     if reply is not None:
         annotations.extend(_effect_lines(reply))
-        check_lines = _reply_check_lines(reply, reply_text, entries, replies, tlk)
+        check_lines = _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects)
         prefix_tags.extend(_check_prefix_tags(check_lines, choice_text))
         annotations.extend(line for line in check_lines if not _check_prefix_tags_for_line(line, choice_text))
         if not check_lines:
-            routed_check_lines = _routed_entry_check_lines(reply, entries, replies, tlk)
+            routed_check_lines = _routed_entry_check_lines(reply, entries, replies, tlk, state_effects)
             if routed_check_lines:
                 prefix_tags.extend(_check_prefix_tags(routed_check_lines, choice_text))
                 annotations.extend(
                     line for line in routed_check_lines if not _check_prefix_tags_for_line(line, choice_text)
                 )
             else:
-                annotations.extend(_routed_entry_effect_lines(reply, entries, replies, tlk))
+                annotations.extend(_routed_entry_effect_lines(reply, entries, replies, tlk, state_effects))
     elif show_unresolved_checks and _tag_without_check_line(reply_text, link, reply):
         annotations.append(_tag_without_check_line(reply_text, link, reply))
     if show_unresolved_checks and reply is not None and not check_lines and not visibility_lines:
@@ -923,41 +1002,20 @@ def _merged_annotations(annotations: list[str]) -> list[str]:
     return [annotation for annotation in merged if annotation]
 
 
-def _entry_text_with_unlinked_effects(
-    entry_index: int,
-    text: str,
-    entries: list[GffStruct],
-    replies: list[GffStruct],
-) -> str:
-    if _entry_has_inbound_link(entry_index, replies):
-        return text
-
-    effects = _merged_annotations(_effect_lines(entries[entry_index]))
-    if not effects:
-        return text
-    return f"{text} [{'; '.join(effects)}]"
-
-
-def _entry_has_inbound_link(entry_index: int, replies: list[GffStruct]) -> bool:
-    for reply in replies:
-        for link in _as_list(reply.get("EntriesList")):
-            if _index_from_link(link) == entry_index:
-                return True
-    return False
-
-
 def _routed_entry_check_lines(
     reply: GffStruct,
     entries: list[GffStruct],
     replies: list[GffStruct],
     tlk: TlkTable,
+    state_effects: StateEffectIndex | None = None,
 ) -> list[str]:
+    state_effects = state_effects or StateEffectIndex({}, {}, {})
     lines: list[str] = []
     for entry_link in _as_list(reply.get("EntriesList")):
         entry_index = _index_from_link(entry_link)
         if entry_index is None or not (0 <= entry_index < len(entries)):
             continue
-        lines.extend(_automatic_route_check_lines(entry_index, entries, replies, tlk, set()))
+        lines.extend(_automatic_route_check_lines(entry_index, entries, replies, tlk, set(), state_effects))
     return list(dict.fromkeys(lines))
 
 
@@ -967,13 +1025,14 @@ def _automatic_route_check_lines(
     replies: list[GffStruct],
     tlk: TlkTable,
     seen: set[int],
+    state_effects: StateEffectIndex,
 ) -> list[str]:
     if entry_index in seen or not (0 <= entry_index < len(entries)):
         return []
 
     seen.add(entry_index)
     entry = entries[entry_index]
-    entry_effects = _effect_lines(entry)
+    entry_effects = _effect_lines(entry) + _state_transition_effect_lines(entry, state_effects)
     lines: list[str] = []
 
     for link in _hidden_continue_links(entry, replies, tlk):
@@ -982,8 +1041,8 @@ def _automatic_route_check_lines(
             continue
 
         reply_text, _notes = _split_designer_notes(_resolve_text(reply, tlk))
-        prefix = entry_effects + _effect_lines(reply)
-        check_lines = _reply_check_lines(reply, reply_text, entries, replies, tlk)
+        prefix = entry_effects + _effect_lines(reply) + _state_transition_effect_lines(reply, state_effects)
+        check_lines = _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects)
         if check_lines:
             lines.extend(prefix + check_lines)
             continue
@@ -994,7 +1053,7 @@ def _automatic_route_check_lines(
             next_index = _index_from_link(next_link)
             if next_index is None:
                 continue
-            child_lines = _automatic_route_check_lines(next_index, entries, replies, tlk, set(seen))
+            child_lines = _automatic_route_check_lines(next_index, entries, replies, tlk, set(seen), state_effects)
             if child_lines:
                 lines.extend(prefix + child_lines)
 
@@ -1006,13 +1065,15 @@ def _routed_entry_effect_lines(
     entries: list[GffStruct],
     replies: list[GffStruct],
     tlk: TlkTable,
+    state_effects: StateEffectIndex | None = None,
 ) -> list[str]:
+    state_effects = state_effects or StateEffectIndex({}, {}, {})
     effects: list[str] = []
     for entry_link in _as_list(reply.get("EntriesList")):
         entry_index = _index_from_link(entry_link)
         if entry_index is None or not (0 <= entry_index < len(entries)):
             continue
-        effects.extend(_automatic_route_effect_lines(entry_index, entries, replies, tlk))
+        effects.extend(_automatic_route_effect_lines(entry_index, entries, replies, tlk, state_effects))
     return list(dict.fromkeys(effects))
 
 
@@ -1021,9 +1082,11 @@ def _automatic_route_effect_lines(
     entries: list[GffStruct],
     replies: list[GffStruct],
     tlk: TlkTable,
+    state_effects: StateEffectIndex | None = None,
 ) -> list[str]:
+    state_effects = state_effects or StateEffectIndex({}, {}, {})
     effects: list[str] = []
-    _collect_automatic_route_effects(start_index, entries, replies, tlk, set(), effects)
+    _collect_automatic_route_effects(start_index, entries, replies, tlk, set(), effects, state_effects)
     return list(dict.fromkeys(effects))
 
 
@@ -1034,6 +1097,7 @@ def _collect_automatic_route_effects(
     tlk: TlkTable,
     seen: set[int],
     effects: list[str],
+    state_effects: StateEffectIndex,
 ) -> None:
     if entry_index in seen or not (0 <= entry_index < len(entries)):
         return
@@ -1041,18 +1105,20 @@ def _collect_automatic_route_effects(
     seen.add(entry_index)
     entry = entries[entry_index]
     effects.extend(_effect_lines(entry))
+    effects.extend(_state_transition_effect_lines(entry, state_effects))
 
     for link in _hidden_continue_links(entry, replies, tlk):
         reply = _linked_reply(link, replies)
         if reply is None:
             continue
         effects.extend(_effect_lines(reply))
+        effects.extend(_state_transition_effect_lines(reply, state_effects))
         for next_link in _as_list(reply.get("EntriesList")):
             if _link_detail_lines(next_link):
                 continue
             next_index = _index_from_link(next_link)
             if next_index is not None:
-                _collect_automatic_route_effects(next_index, entries, replies, tlk, set(seen), effects)
+                _collect_automatic_route_effects(next_index, entries, replies, tlk, set(seen), effects, state_effects)
 
 
 def _resolve_text(node: GffStruct, tlk: TlkTable) -> str:
@@ -1099,7 +1165,9 @@ def _reply_check_lines(
     entries: list[GffStruct],
     replies: list[GffStruct],
     tlk: TlkTable,
+    state_effects: StateEffectIndex | None = None,
 ) -> list[str]:
+    state_effects = state_effects or StateEffectIndex({}, {}, {})
     checks: list[tuple[dict[str, object], int]] = []
     fallback_entries: list[int] = []
     for link in _as_list(reply.get("EntriesList")):
@@ -1129,34 +1197,34 @@ def _reply_check_lines(
         success_checks.sort(key=lambda item: int(item[0]["dc"]), reverse=True)
         for check, entry_index in success_checks:
             condition = _outcome_check_condition(check, reply_text)
-            lines.append(f"{condition}: {_entry_outcome(entry_index, entries, replies, tlk)}")
+            lines.append(f"{condition}: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
         if fallback_entries:
-            lines.append(f"otherwise: {_entry_outcomes(fallback_entries, entries, replies, tlk)}")
+            lines.append(f"otherwise: {_entry_outcomes(fallback_entries, entries, replies, tlk, state_effects)}")
         for check, entry_index in lt_checks:
             lines.append(f"DC {check['dc']}")
-            lines.append(f"failure: {_entry_outcome(entry_index, entries, replies, tlk)}")
+            lines.append(f"failure: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
         for check, entry_index in other_checks:
             lines.append(_skill_check_label(check))
-            lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk)}")
+            lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
         return lines
 
     for check, entry_index in gt_checks:
         lines.append(_outcome_check_condition(check, reply_text))
-        lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk)}")
+        lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
         if fallback_entries:
-            lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, replies, tlk)}")
+            lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, replies, tlk, state_effects)}")
 
     for check, entry_index in lt_checks:
         lines.append(_outcome_check_condition(check, reply_text))
         if fallback_entries:
-            lines.append(f"success: {_entry_outcomes(fallback_entries, entries, replies, tlk)}")
-        lines.append(f"failure: {_entry_outcome(entry_index, entries, replies, tlk)}")
+            lines.append(f"success: {_entry_outcomes(fallback_entries, entries, replies, tlk, state_effects)}")
+        lines.append(f"failure: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
 
     for check, entry_index in other_checks:
         lines.append(_skill_check_label(check))
-        lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk)}")
+        lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
         if fallback_entries:
-            lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, replies, tlk)}")
+            lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, replies, tlk, state_effects)}")
     return lines
 
 
@@ -1204,12 +1272,11 @@ def _visibility_prefix_tag_for_line(check_line: str, choice_text: str) -> str:
     line = check_line.removeprefix("Requires ").strip()
     match = re.fullmatch(r"(?P<label>.+?) below (?P<dc>\d+)", line)
     if match and _choice_tag_matches_check(choice_text, match.group("label")):
-        return f"{match.group('label').strip()} below {match.group('dc')}"
+        return f"below DC {match.group('dc')}"
 
     match = re.fullmatch(r"(?P<label>.+?) (?P<dc>\d+)(?: \+ (?P<item>.+))?", line)
     if match and _choice_tag_matches_check(choice_text, match.group("label")):
-        item = f" + {match.group('item')}" if match.group("item") else ""
-        return f"{match.group('label').strip()} {match.group('dc')}{item}"
+        return f"DC {match.group('dc')}"
 
     return ""
 
@@ -1279,6 +1346,272 @@ def _normalize_check_label(label: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", normalized)
 
 
+def _build_state_effect_index(
+    parsed: list[ParsedDialogue],
+    scripts: list[ScriptResource],
+    tlk: TlkTable,
+) -> StateEffectIndex:
+    script_analysis = _script_state_analyses(scripts)
+    empty_index = StateEffectIndex({}, {}, {})
+    effects_by_state: dict[tuple[str, int], list[str]] = {}
+
+    for item in parsed:
+        entries = _as_list(item.root.get("EntryList"))
+        replies = _as_list(item.root.get("ReplyList"))
+        for start_link in _as_list(item.root.get("StartingList")):
+            entry_index = _index_from_link(start_link)
+            if entry_index is None or not (0 <= entry_index < len(entries)):
+                continue
+
+            effects = _automatic_route_effect_lines(entry_index, entries, replies, tlk, empty_index)
+            if not effects:
+                continue
+
+            for field, suffix in (("Active", ""), ("Active2", "b")):
+                script = _script_key(_plain_text(start_link.get(field)))
+                state_value = _condition_param(start_link, 1, suffix)
+                if not script or state_value is None:
+                    continue
+
+                analysis = script_analysis.get(script)
+                if analysis is None:
+                    continue
+                for global_name in analysis.global_reads:
+                    key = (_state_key(global_name), state_value)
+                    _extend_unique(effects_by_state.setdefault(key, []), effects)
+
+    dynamic_global_sets: dict[str, list[str]] = {}
+    constant_global_sets: dict[tuple[str, int], list[tuple[str, int]]] = {}
+    for script, analysis in script_analysis.items():
+        if analysis.dynamic_global_sets:
+            dynamic_global_sets[script] = sorted(analysis.dynamic_global_sets)
+        for param_value, pairs in analysis.constant_global_sets.items():
+            constant_global_sets[(script, param_value)] = list(dict.fromkeys(pairs))
+
+    return StateEffectIndex(
+        effects_by_state=effects_by_state,
+        dynamic_global_sets=dynamic_global_sets,
+        constant_global_sets=constant_global_sets,
+    )
+
+
+def _script_state_analyses(scripts: list[ScriptResource]) -> dict[str, NcsStateAnalysis]:
+    analyses: dict[str, NcsStateAnalysis] = {}
+    for resource in scripts:
+        script = _script_key(resource.script_name)
+        if not script:
+            continue
+        try:
+            analysis = _analyze_ncs_state(resource.data)
+        except ValueError:
+            continue
+        if not analysis.global_reads and not analysis.dynamic_global_sets and not analysis.constant_global_sets:
+            continue
+
+        existing = analyses.setdefault(script, NcsStateAnalysis(set(), set(), {}))
+        existing.global_reads.update(analysis.global_reads)
+        existing.dynamic_global_sets.update(analysis.dynamic_global_sets)
+        for param_value, pairs in analysis.constant_global_sets.items():
+            _extend_unique(existing.constant_global_sets.setdefault(param_value, []), pairs)
+    return analyses
+
+
+def _analyze_ncs_state(data: bytes) -> NcsStateAnalysis:
+    instructions = _read_ncs_instructions(data)
+    analysis = NcsStateAnalysis(set(), set(), {})
+    current_param: int | None = None
+
+    for index, instruction in enumerate(instructions):
+        branch_param = _script_param_branch_value(instructions, index)
+        if branch_param is not None:
+            current_param = branch_param
+
+        if _is_action(instruction, 580):
+            global_name, _string_index = _previous_const_string(instructions, index)
+            if global_name:
+                analysis.global_reads.add(global_name)
+            continue
+
+        if not _is_action(instruction, 581):
+            continue
+
+        global_name, string_index = _previous_const_string(instructions, index)
+        if not global_name or string_index is None:
+            continue
+
+        value_instruction = _previous_instruction(instructions, string_index)
+        if value_instruction is None:
+            continue
+
+        if _is_const_int(value_instruction):
+            value = int(value_instruction.args[0])
+            param_value = current_param if current_param is not None else 0
+            analysis.constant_global_sets.setdefault(param_value, []).append((global_name, value))
+        elif _is_stack_copy(value_instruction):
+            analysis.dynamic_global_sets.add(global_name)
+
+    for param_value, pairs in list(analysis.constant_global_sets.items()):
+        analysis.constant_global_sets[param_value] = list(dict.fromkeys(pairs))
+    return analysis
+
+
+def _read_ncs_instructions(data: bytes) -> list[NcsInstruction]:
+    if len(data) < 13 or data[:4] != b"NCS " or data[4:8] != b"V1.0":
+        raise ValueError("unsupported NCS header")
+
+    declared_size = struct.unpack_from(">I", data, 9)[0]
+    limit = min(declared_size, len(data))
+    position = 13
+    instructions: list[NcsInstruction] = []
+
+    while position < limit:
+        if position + 2 > limit:
+            raise ValueError("truncated NCS instruction")
+
+        opcode = data[position]
+        qualifier = data[position + 1]
+        position += 2
+        args: tuple[object, ...] = ()
+
+        if opcode in {0x01, 0x03, 0x26, 0x27}:
+            _require_ncs_range(data, position, 6, limit)
+            args = (struct.unpack_from(">i", data, position)[0], struct.unpack_from(">H", data, position + 4)[0])
+            position += 6
+        elif opcode == 0x04:
+            if qualifier == 0x03:
+                _require_ncs_range(data, position, 4, limit)
+                args = (struct.unpack_from(">i", data, position)[0],)
+                position += 4
+            elif qualifier == 0x04:
+                _require_ncs_range(data, position, 4, limit)
+                args = (struct.unpack_from(">f", data, position)[0],)
+                position += 4
+            elif qualifier == 0x05:
+                _require_ncs_range(data, position, 2, limit)
+                length = struct.unpack_from(">H", data, position)[0]
+                position += 2
+                _require_ncs_range(data, position, length, limit)
+                args = (data[position : position + length].decode("ascii", "ignore"),)
+                position += length
+            else:
+                _require_ncs_range(data, position, 4, limit)
+                args = (struct.unpack_from(">i", data, position)[0],)
+                position += 4
+        elif opcode == 0x05:
+            _require_ncs_range(data, position, 3, limit)
+            args = (struct.unpack_from(">H", data, position)[0], data[position + 2])
+            position += 3
+        elif opcode in {0x1B, 0x1D, 0x1E, 0x1F, 0x25}:
+            _require_ncs_range(data, position, 4, limit)
+            args = (struct.unpack_from(">i", data, position)[0],)
+            position += 4
+        elif opcode == 0x21:
+            _require_ncs_range(data, position, 6, limit)
+            args = (
+                struct.unpack_from(">H", data, position)[0],
+                struct.unpack_from(">h", data, position + 2)[0],
+                struct.unpack_from(">H", data, position + 4)[0],
+            )
+            position += 6
+        elif opcode in {0x23, 0x24, 0x28, 0x29}:
+            _require_ncs_range(data, position, 4, limit)
+            args = (struct.unpack_from(">I", data, position)[0],)
+            position += 4
+        elif opcode == 0x2C:
+            _require_ncs_range(data, position, 8, limit)
+            args = (struct.unpack_from(">I", data, position)[0], struct.unpack_from(">I", data, position + 4)[0])
+            position += 8
+        elif opcode in {0x0B, 0x0C} and qualifier == 0x24:
+            _require_ncs_range(data, position, 2, limit)
+            args = (struct.unpack_from(">H", data, position)[0],)
+            position += 2
+
+        instructions.append(NcsInstruction(opcode, qualifier, args))
+
+    return instructions
+
+
+def _require_ncs_range(data: bytes, offset: int, size: int, limit: int) -> None:
+    if offset < 0 or size < 0 or offset + size > limit or offset + size > len(data):
+        raise ValueError("truncated NCS instruction")
+
+
+def _script_param_branch_value(instructions: list[NcsInstruction], index: int) -> int | None:
+    if index < 3:
+        return None
+    if not _is_jump_zero(instructions[index]):
+        return None
+    if not _is_stack_copy(instructions[index - 3]):
+        return None
+    if not _is_const_int(instructions[index - 2]):
+        return None
+    if not _is_int_equality(instructions[index - 1]):
+        return None
+    return int(instructions[index - 2].args[0])
+
+
+def _previous_const_string(instructions: list[NcsInstruction], index: int) -> tuple[str, int | None]:
+    previous = _previous_instruction(instructions, index)
+    if previous is None or previous.opcode != 0x04 or previous.qualifier != 0x05:
+        return "", None
+    return str(previous.args[0]), index - 1
+
+
+def _previous_instruction(instructions: list[NcsInstruction], index: int) -> NcsInstruction | None:
+    return instructions[index - 1] if index > 0 else None
+
+
+def _is_action(instruction: NcsInstruction, action_id: int) -> bool:
+    return instruction.opcode == 0x05 and bool(instruction.args) and int(instruction.args[0]) == action_id
+
+
+def _is_const_int(instruction: NcsInstruction) -> bool:
+    return instruction.opcode == 0x04 and instruction.qualifier == 0x03 and bool(instruction.args)
+
+
+def _is_stack_copy(instruction: NcsInstruction) -> bool:
+    return instruction.opcode in {0x03, 0x27}
+
+
+def _is_int_equality(instruction: NcsInstruction) -> bool:
+    return instruction.opcode == 0x0B and instruction.qualifier == 0x20
+
+
+def _is_jump_zero(instruction: NcsInstruction) -> bool:
+    return instruction.opcode == 0x1F
+
+
+def _state_transition_effect_lines(node: GffStruct, state_effects: StateEffectIndex) -> list[str]:
+    effects: list[str] = []
+    for script, params in _action_script_calls(node):
+        script_key = _script_key(script)
+        if not script_key:
+            continue
+        state_value = params[0] if params else 0
+
+        for global_name, value in state_effects.constant_global_sets.get((script_key, state_value), []):
+            effects.extend(state_effects.effects_by_state.get((_state_key(global_name), value), []))
+
+        for global_name in state_effects.dynamic_global_sets.get(script_key, []):
+            effects.extend(state_effects.effects_by_state.get((_state_key(global_name), state_value), []))
+
+    return _merged_annotations(effects)
+
+
+def _script_key(script: str) -> str:
+    return Path(script).stem.lower()
+
+
+def _state_key(global_name: str) -> str:
+    return global_name.lower()
+
+
+def _extend_unique(items: list, additions: list) -> None:
+    for item in additions:
+        if item not in items:
+            items.append(item)
+
+
 def _effect_lines(node: GffStruct) -> list[str]:
     effects: list[str] = []
     for script, params in _action_script_calls(node):
@@ -1343,8 +1676,10 @@ def _entry_outcomes(
     entries: list[GffStruct],
     replies: list[GffStruct],
     tlk: TlkTable,
+    state_effects: StateEffectIndex | None = None,
 ) -> str:
-    return ", ".join(_entry_outcome(index, entries, replies, tlk) for index in indices)
+    state_effects = state_effects or StateEffectIndex({}, {}, {})
+    return ", ".join(_entry_outcome(index, entries, replies, tlk, state_effects) for index in indices)
 
 
 def _entry_outcome(
@@ -1352,10 +1687,12 @@ def _entry_outcome(
     entries: list[GffStruct],
     replies: list[GffStruct],
     tlk: TlkTable,
+    state_effects: StateEffectIndex | None = None,
 ) -> str:
+    state_effects = state_effects or StateEffectIndex({}, {}, {})
     summary = ""
     if 0 <= index < len(entries):
-        summary = _outcome_summary(index, entries, replies, tlk)
+        summary = _outcome_summary(index, entries, replies, tlk, state_effects)
     return summary or f"Entry {index}"
 
 
@@ -1364,8 +1701,9 @@ def _outcome_summary(
     entries: list[GffStruct],
     replies: list[GffStruct],
     tlk: TlkTable,
+    state_effects: StateEffectIndex | None = None,
 ) -> str:
-    effects = _automatic_route_effect_lines(index, entries, replies, tlk)
+    effects = _automatic_route_effect_lines(index, entries, replies, tlk, state_effects)
     if effects:
         return ", ".join(effects)
     return ""
