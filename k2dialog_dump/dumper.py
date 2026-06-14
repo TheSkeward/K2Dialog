@@ -46,6 +46,8 @@ class StateEffectIndex:
     effects_by_state: dict[tuple[str, int], list[str]]
     dynamic_global_sets: dict[str, list[str]]
     constant_global_sets: dict[tuple[str, int], list[tuple[str, int]]]
+    script_effects_by_module: dict[tuple[str, str], list[str]] | None = None
+    score_effects_by_global: dict[tuple[str, int], str] | None = None
     contextual_script_effects: dict[tuple[str, str, int], list[str]] | None = None
     cross_module_script_effects: dict[tuple[str, int], list[str]] | None = None
     current_module: str | None = None
@@ -57,6 +59,23 @@ class StateEffectIndex:
 class SpeakerNameIndex:
     names_by_module_key: dict[tuple[str, str], list[str]]
     names_by_key: dict[str, list[str]]
+
+
+@dataclass(frozen=True)
+class CrossDialoguePrelude:
+    turns: tuple[tuple[str, str], ...]
+    source_dlg_name: str
+    label: str = ""
+
+
+MOVIE_TRANSCRIPT_STRREFS: dict[str, tuple[str, tuple[int, ...]]] = {
+    # a_playkremov01 plays KreMov01.bik ("Kreia's Fall"). The spoken text is
+    # present in dialog.tlk, but the movie handoff is not linked as DLG nodes.
+    "a_playkremov01": (
+        "Kreia",
+        (119923, 119924, 119926, 119928, 119930, 119934, 119936, 119938),
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -111,8 +130,9 @@ def dump_game(options: DumpOptions) -> list[DumpedDialogue]:
         except Exception as exc:
             LOGGER.warning("failed to parse %s::%s: %s", resource.source_path, resource.dlg_name, exc)
 
+    script_resources = find_script_resources(game_dir)
     try:
-        state_effects = _build_state_effect_index(parsed, find_script_resources(game_dir), tlk)
+        state_effects = _build_state_effect_index(parsed, script_resources, tlk)
     except Exception as exc:
         LOGGER.warning("failed to inspect compiled scripts for deferred effects: %s", exc)
         state_effects = StateEffectIndex({}, {}, {})
@@ -123,6 +143,14 @@ def dump_game(options: DumpOptions) -> list[DumpedDialogue]:
         LOGGER.warning("failed to inspect creature/placeable names: %s", exc)
         speaker_names = SpeakerNameIndex({}, {})
 
+    cross_dialogue_preludes = _build_cross_dialogue_preludes(
+        parsed,
+        tlk,
+        speaker_names,
+        state_effects,
+        script_resources,
+    )
+
     dumped: list[DumpedDialogue] = []
     for item in parsed:
         try:
@@ -132,6 +160,7 @@ def dump_game(options: DumpOptions) -> list[DumpedDialogue]:
                 tlk,
                 state_effects=state_effects,
                 speaker_names=speaker_names,
+                cross_dialogue_preludes=cross_dialogue_preludes,
                 show_unresolved_checks=options.show_unresolved_checks,
             )
             if not markdown.strip():
@@ -157,6 +186,7 @@ def render_dialogue(
     *,
     state_effects: StateEffectIndex | None = None,
     speaker_names: SpeakerNameIndex | None = None,
+    cross_dialogue_preludes: dict[tuple[str, str, int], list[CrossDialoguePrelude]] | None = None,
     show_unresolved_checks: bool = False,
 ) -> str:
     state_effects = state_effects or StateEffectIndex({}, {}, {})
@@ -169,6 +199,7 @@ def render_dialogue(
     speaker_hint = _conversation_speaker_hint(resource, root, speaker_names)
     if _is_low_value_dialogue(resource, entries, replies, tlk):
         return ""
+    state_transition_preludes = _state_transition_preludes(resource, root, entries, replies, tlk)
 
     lines: list[str] = []
     title = f"{resource.module_name or 'Unknown'} / {resource.dlg_name}"
@@ -205,6 +236,10 @@ def render_dialogue(
                 state_effects,
                 show_unresolved_checks=show_unresolved_checks,
             )
+            block = _apply_cross_dialogue_preludes(
+                block,
+                _preludes_for(resource, index, cross_dialogue_preludes, state_transition_preludes),
+            )
             if _block_seen(block, seen_blocks):
                 skip_entries.update(forced_path[0])
                 continue
@@ -231,6 +266,10 @@ def render_dialogue(
                 speaker_hint,
                 state_effects,
                 show_unresolved_checks=show_unresolved_checks,
+            )
+            block = _apply_cross_dialogue_preludes(
+                block,
+                _preludes_for(resource, index, cross_dialogue_preludes, state_transition_preludes),
             )
             prefix_indices, _prefix_turns, routed_paths = forced_paths
             if _block_seen(block, seen_blocks):
@@ -266,6 +305,10 @@ def render_dialogue(
                     state_effects,
                     show_unresolved_checks=show_unresolved_checks,
                 )
+                block = _apply_cross_dialogue_preludes(
+                    block,
+                    _preludes_for(resource, index, cross_dialogue_preludes, state_transition_preludes),
+                )
                 if _block_seen(block, seen_blocks):
                     skip_entries.update(chain)
                     continue
@@ -295,6 +338,10 @@ def render_dialogue(
                         speaker_hint,
                         state_effects,
                         show_unresolved_checks=show_unresolved_checks,
+                    )
+                    block = _apply_cross_dialogue_preludes(
+                        block,
+                        _preludes_for(resource, index, cross_dialogue_preludes, state_transition_preludes),
                     )
                     if _block_seen(block, seen_blocks):
                         skip_entries.update(transcript_chain)
@@ -336,6 +383,10 @@ def render_dialogue(
                     state_effects,
                     show_unresolved_checks=show_unresolved_checks,
                 )
+            block = _apply_cross_dialogue_preludes(
+                block,
+                _preludes_for(resource, index, cross_dialogue_preludes, state_transition_preludes),
+            )
             if _block_seen(block, seen_blocks):
                 skip_entries.add(index)
                 continue
@@ -358,6 +409,10 @@ def render_dialogue(
             speaker_hint,
             state_effects,
             show_unresolved_checks=show_unresolved_checks,
+        )
+        block = _apply_cross_dialogue_preludes(
+            block,
+            _preludes_for(resource, index, cross_dialogue_preludes, state_transition_preludes),
         )
         if _block_seen(block, seen_blocks):
             continue
@@ -417,7 +472,7 @@ def _auto_next_entries(entry: GffStruct, replies: list[GffStruct], tlk: TlkTable
         reply = _linked_reply(link, replies)
         if reply is None:
             continue
-        for next_link in _as_list(reply.get("EntriesList")):
+        for next_link in _ordered_entry_links(_as_list(reply.get("EntriesList"))):
             if _link_detail_lines(next_link):
                 continue
             next_index = _index_from_link(next_link)
@@ -440,6 +495,19 @@ def _linked_reply(link: GffStruct, replies: list[GffStruct]) -> GffStruct | None
     if reply_index is None or not (0 <= reply_index < len(replies)):
         return None
     return replies[reply_index]
+
+
+def _ordered_entry_links(links: list[GffStruct]) -> list[GffStruct]:
+    reachable: list[GffStruct] = []
+    for link in links:
+        reachable.append(link)
+        if not _link_has_condition(link):
+            break
+    return reachable
+
+
+def _link_has_condition(link: GffStruct) -> bool:
+    return bool(_plain_text(link.get("Active")) or _plain_text(link.get("Active2")))
 
 
 def _auto_route_reaches_meaningful_replies(
@@ -558,7 +626,7 @@ def _forced_reply_transcript_path_to_choices(
         if _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects):
             return None
 
-        next_links = _as_list(reply.get("EntriesList"))
+        next_links = _ordered_entry_links(_as_list(reply.get("EntriesList")))
         if len(next_links) != 1:
             return None
         next_link = next_links[0]
@@ -619,7 +687,7 @@ def _forced_reply_transcript_paths_to_choices(
         if _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects):
             return None
 
-        next_links = _as_list(reply.get("EntriesList"))
+        next_links = _ordered_entry_links(_as_list(reply.get("EntriesList")))
         if len(next_links) != 1:
             return None
         next_link = next_links[0]
@@ -667,38 +735,92 @@ def _auto_next_entry_labels(entry: GffStruct, replies: list[GffStruct], tlk: Tlk
     if not links:
         return []
 
-    sibling_entry_scripts = {_plain_text(link.get("Active")).lower() for link in links}
-
     targets: list[tuple[str, int]] = []
     for link in links:
         reply = _linked_reply(link, replies)
         if reply is None:
             continue
-        next_links = _as_list(reply.get("EntriesList"))
-        sibling_scripts = {_plain_text(next_link.get("Active")).lower() for next_link in next_links}
-        link_label = _auto_link_condition_label(link, sibling_entry_scripts)
+        next_links = _ordered_entry_links(_as_list(reply.get("EntriesList")))
+        link_label = _auto_link_condition_label(link, links)
         for next_link in next_links:
             if _link_detail_lines(next_link):
                 continue
             next_index = _index_from_link(next_link)
             if next_index is not None:
-                next_label = _auto_link_condition_label(next_link, sibling_scripts)
+                next_label = _auto_link_condition_label(next_link, next_links)
                 targets.append((_condition_label_join(link_label, next_label), next_index))
     return targets
 
 
-def _auto_link_condition_label(link: GffStruct, sibling_scripts: set[str]) -> str:
+def _auto_link_condition_label(link: GffStruct, siblings: list[GffStruct] | set[str]) -> str:
+    sibling_scripts = (
+        {_plain_text(sibling.get("Active")).lower() for sibling in siblings}
+        if isinstance(siblings, list)
+        else siblings
+    )
     script = _plain_text(link.get("Active")).lower()
     label = _condition_label(script)
     if label or script:
-        return label
+        return label or _condition_detail_label(link, script)
     if "c_ismale" in sibling_scripts:
         return "female Exile"
     if "c_isfemale" in sibling_scripts:
         return "male Exile"
     if "c_con_attonpm" in sibling_scripts:
         return "Atton absent"
+    if isinstance(siblings, list):
+        fallback = _fallback_condition_label(siblings)
+        if fallback:
+            return fallback
+    if any(candidate in sibling_scripts for candidate in {"c_glob_bool_set", "c_global_bool_set"}):
+        return "otherwise"
+    if any(candidate in sibling_scripts for candidate in {"c_glob_bool_notset", "c_global_bool_notset"}):
+        return "otherwise"
     return ""
+
+
+def _condition_detail_label(link: GffStruct, script: str) -> str:
+    global_name = _plain_text(link.get("ParamStrA"))
+    value = _condition_param(link, 1, "")
+    if script in {"c_glob_bool_set", "c_global_bool_set"} and global_name:
+        known = _known_global_bool_label(global_name, True)
+        if known:
+            return known
+        return f"{global_name} set"
+    if script in {"c_glob_bool_notset", "c_global_bool_notset"} and global_name:
+        known = _known_global_bool_label(global_name, False)
+        if known:
+            return known
+        return f"{global_name} not set"
+    if script in {"c_global_eq", "c_global_gt", "c_global_lt"} and global_name and value is not None:
+        op = {"c_global_eq": "=", "c_global_gt": ">", "c_global_lt": "<"}[script]
+        return f"{global_name} {op} {value}"
+    if script in {"c_local_set", "c_local_notset"} and value is not None:
+        state = "set" if script == "c_local_set" else "not set"
+        return f"local {value} {state}"
+    return ""
+
+
+def _fallback_condition_label(sibling_links: list[GffStruct]) -> str:
+    for sibling in sibling_links:
+        for field in ("Active", "Active2"):
+            script = _plain_text(sibling.get(field)).lower()
+            global_name = _plain_text(sibling.get("ParamStrA" if field == "Active" else "ParamStrB"))
+            if script in {"c_glob_bool_set", "c_global_bool_set"} and global_name:
+                return _known_global_bool_label(global_name, False) or "otherwise"
+            if script in {"c_glob_bool_notset", "c_global_bool_notset"} and global_name:
+                return _known_global_bool_label(global_name, True) or "otherwise"
+    return ""
+
+
+def _known_global_bool_label(global_name: str, is_set: bool) -> str:
+    labels = {
+        "262tel_hand_send": ("Handmaiden sent by Atris", "Handmaiden left on her own"),
+    }
+    pair = labels.get(global_name.lower())
+    if pair is None:
+        return ""
+    return pair[0] if is_set else pair[1]
 
 
 def _combine_variant_labels(first: str, second: str) -> str:
@@ -1046,6 +1168,193 @@ def _merge_turns(turns: list[tuple[str, list[str]]]) -> list[tuple[str, list[str
     return merged
 
 
+def _preludes_for(
+    resource: DialogueResource,
+    entry_index: int,
+    cross_dialogue_preludes: dict[tuple[str, str, int], list[CrossDialoguePrelude]] | None,
+    state_transition_preludes: dict[int, list[CrossDialoguePrelude]] | None = None,
+) -> list[CrossDialoguePrelude]:
+    found: list[CrossDialoguePrelude] = []
+    key = ((resource.module_name or "").lower(), resource.dlg_name.lower(), entry_index)
+    if cross_dialogue_preludes:
+        found.extend(cross_dialogue_preludes.get(key, []))
+    if state_transition_preludes:
+        for prelude in state_transition_preludes.get(entry_index, []):
+            if prelude not in found:
+                found.append(prelude)
+    return found
+
+
+def _state_transition_preludes(
+    resource: DialogueResource,
+    root: GffStruct,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+) -> dict[int, list[CrossDialoguePrelude]]:
+    starts_by_state: dict[tuple[str, int], list[int]] = {}
+    for start_link in _as_list(root.get("StartingList")):
+        entry_index = _index_from_link(start_link)
+        if entry_index is None:
+            continue
+        for state in _condition_states_from_link(start_link, resource.module_name):
+            _extend_unique(starts_by_state.setdefault(state, []), [entry_index])
+
+    if not starts_by_state:
+        return {}
+
+    preludes: dict[int, list[CrossDialoguePrelude]] = {}
+    for reply in replies:
+        reply_text, _notes = _split_designer_notes(_resolve_text(reply, tlk))
+        if not reply_text:
+            continue
+        if _ordered_entry_links(_as_list(reply.get("EntriesList"))):
+            continue
+
+        target_indices: list[int] = []
+        for state in _direct_action_state_sets(reply, resource.module_name):
+            _extend_unique(target_indices, starts_by_state.get(state, []))
+        if not target_indices:
+            continue
+
+        turns = _movie_transcript_turns(reply, tlk)
+        if not turns:
+            continue
+        prelude = CrossDialoguePrelude(turns=tuple(turns), source_dlg_name=resource.dlg_name)
+        for target_index in target_indices:
+            bucket = preludes.setdefault(target_index, [])
+            if prelude not in bucket:
+                bucket.append(prelude)
+    return preludes
+
+
+def _apply_cross_dialogue_preludes(
+    block: list[str],
+    preludes: list[CrossDialoguePrelude],
+) -> list[str]:
+    if not preludes:
+        return block
+
+    prelude_lines = _render_cross_dialogue_preludes(preludes)
+    if not prelude_lines:
+        return block
+
+    if len(block) >= 2 and block[0].startswith("## ") and block[1] == "":
+        return [block[0], "", *_merge_prelude_with_block_body(prelude_lines, block[2:])]
+    return _merge_prelude_with_block_body(prelude_lines, block)
+
+
+def _render_cross_dialogue_preludes(preludes: list[CrossDialoguePrelude]) -> list[str]:
+    previous_choices = _previous_choice_prelude_lines(preludes)
+    if previous_choices is not None:
+        return previous_choices
+
+    rendered: list[tuple[str, list[str]]] = []
+    seen_blocks: dict[str, int] = {}
+    for prelude in preludes:
+        lines = _render_prelude_turn_lines(prelude.turns)
+        fingerprint = _block_fingerprint(lines)
+        if fingerprint in seen_blocks:
+            existing_index = seen_blocks[fingerprint]
+            existing_label, existing_lines = rendered[existing_index]
+            rendered[existing_index] = (_combine_variant_labels(existing_label, prelude.label), existing_lines)
+            continue
+        seen_blocks[fingerprint] = len(rendered)
+        rendered.append((prelude.label, lines))
+
+    lines: list[str] = []
+    show_variant_headings = len(rendered) > 1 or any(label for label, _variant_lines in rendered)
+    for label, variant_lines in rendered:
+        if show_variant_headings:
+            heading = f" ({label})" if label else ""
+            lines.append(f"Variant{heading}:")
+        lines.extend(variant_lines)
+        lines.append("")
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def _previous_choice_prelude_lines(preludes: list[CrossDialoguePrelude]) -> list[str] | None:
+    if len(preludes) <= 1:
+        return None
+
+    choices: list[str] = []
+    shared_suffix: tuple[tuple[str, str], ...] | None = None
+    for prelude in preludes:
+        if prelude.label or not prelude.turns:
+            return None
+        speaker, text = prelude.turns[0]
+        if speaker != "Exile" or not text:
+            return None
+        if text not in choices:
+            choices.append(text)
+        suffix = prelude.turns[1:]
+        if shared_suffix is None:
+            shared_suffix = suffix
+        elif suffix != shared_suffix:
+            return None
+
+    if len(choices) <= 1 or not shared_suffix:
+        return None
+    return _render_prelude_turn_lines(shared_suffix)
+
+
+def _render_prelude_turn_lines(turns: tuple[tuple[str, str], ...]) -> list[str]:
+    lines: list[str] = []
+    for speaker, parts in _merge_turns([(speaker, [text]) for speaker, text in turns]):
+        text = _paragraph(" ".join(parts))
+        if speaker:
+            lines.append(f"**{_md_escape(speaker)}:** {text}")
+        else:
+            lines.append(text)
+    return lines
+
+
+def _merge_prelude_with_block_body(prelude_lines: list[str], body: list[str]) -> list[str]:
+    prefix = list(prelude_lines)
+    while prefix and prefix[-1] == "":
+        prefix.pop()
+    if not prefix:
+        return body
+    if not body:
+        return prefix
+
+    last_speaker = _speaker_line_parts(prefix[-1])
+    first_speaker = _speaker_line_parts(body[0])
+    if last_speaker is not None and first_speaker is not None and last_speaker[0] == first_speaker[0]:
+        speaker, before = last_speaker
+        _same_speaker, after = first_speaker
+        merged = f"**{speaker}:** {_paragraph(f'{before} {after}')}"
+        return [*prefix[:-1], merged, *body[1:]]
+
+    return [*prefix, "", *body]
+
+
+def _speaker_line_parts(line: str) -> tuple[str, str] | None:
+    match = re.match(r"^\*\*(.+?):\*\* (.*)$", line)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _movie_transcript_turns(node: GffStruct, tlk: TlkTable) -> list[tuple[str, str]]:
+    turns: list[tuple[str, str]] = []
+    for script, _params in _action_script_calls(node):
+        movie = MOVIE_TRANSCRIPT_STRREFS.get(_script_key(script))
+        if movie is None:
+            continue
+        speaker, strrefs = movie
+        parts: list[str] = []
+        for strref in strrefs:
+            text, _notes = _split_designer_notes(tlk.get(strref))
+            if text:
+                parts.append(text)
+        if parts:
+            turns.append((speaker, " ".join(parts)))
+    return turns
+
+
 def _render_entry(
     index: int,
     entry: GffStruct,
@@ -1122,6 +1431,9 @@ def _reply_line_text(
     state_effects: StateEffectIndex | None = None,
     *,
     show_unresolved_checks: bool = False,
+    include_common_reply_effects: bool = True,
+    include_outcome_annotations: bool = True,
+    common_effect_seen: set[int] | None = None,
 ) -> str:
     parts = _reply_line_parts(
         link,
@@ -1130,6 +1442,9 @@ def _reply_line_text(
         tlk,
         state_effects,
         show_unresolved_checks=show_unresolved_checks,
+        include_common_reply_effects=include_common_reply_effects,
+        include_outcome_annotations=include_outcome_annotations,
+        common_effect_seen=common_effect_seen,
     )
     if parts is None:
         return ""
@@ -1168,7 +1483,7 @@ def _reply_line_parts(
     prefix_tags = _visibility_prefix_tags(visibility_lines, choice_text)
     check_lines: list[str] = []
     if reply is not None:
-        annotations.extend(_effect_lines(reply))
+        annotations.extend(_effect_lines(reply, state_effects))
         if include_outcome_annotations:
             check_lines = _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects)
             prefix_tags.extend(_check_prefix_tags(check_lines, choice_text))
@@ -1323,7 +1638,7 @@ def _routed_entry_check_lines(
 ) -> list[str]:
     state_effects = state_effects or StateEffectIndex({}, {}, {})
     lines: list[str] = []
-    for entry_link in _as_list(reply.get("EntriesList")):
+    for entry_link in _ordered_entry_links(_as_list(reply.get("EntriesList"))):
         entry_index = _index_from_link(entry_link)
         if entry_index is None or not (0 <= entry_index < len(entries)):
             continue
@@ -1344,7 +1659,7 @@ def _automatic_route_check_lines(
 
     seen.add(entry_index)
     entry = entries[entry_index]
-    entry_effects = _effect_lines(entry) + _state_transition_effect_lines(entry, state_effects)
+    entry_effects = _effect_lines(entry, state_effects) + _state_transition_effect_lines(entry, state_effects)
     lines: list[str] = []
 
     for link in _hidden_continue_links(entry, replies, tlk):
@@ -1353,13 +1668,13 @@ def _automatic_route_check_lines(
             continue
 
         reply_text, _notes = _split_designer_notes(_resolve_text(reply, tlk))
-        prefix = entry_effects + _effect_lines(reply) + _state_transition_effect_lines(reply, state_effects)
+        prefix = entry_effects + _effect_lines(reply, state_effects) + _state_transition_effect_lines(reply, state_effects)
         check_lines = _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects)
         if check_lines:
             lines.extend(prefix + check_lines)
             continue
 
-        for next_link in _as_list(reply.get("EntriesList")):
+        for next_link in _ordered_entry_links(_as_list(reply.get("EntriesList"))):
             if _link_detail_lines(next_link):
                 continue
             next_index = _index_from_link(next_link)
@@ -1384,7 +1699,7 @@ def _routed_entry_effect_lines(
 ) -> list[str]:
     state_effects = state_effects or StateEffectIndex({}, {}, {})
     branch_effects: list[list[str]] = []
-    for entry_link in _as_list(reply.get("EntriesList")):
+    for entry_link in _ordered_entry_links(_as_list(reply.get("EntriesList"))):
         entry_index = _index_from_link(entry_link)
         if entry_index is None or not (0 <= entry_index < len(entries)):
             continue
@@ -1439,6 +1754,116 @@ def _automatic_route_effect_lines(
     return result
 
 
+def _automatic_route_possible_effect_lines(
+    start_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex | None = None,
+    *,
+    include_common_reply_effects: bool = True,
+    common_effect_seen: set[int] | None = None,
+) -> list[str]:
+    state_effects = state_effects or StateEffectIndex({}, {}, {})
+    branches = _automatic_route_possible_effect_paths(
+        start_index,
+        entries,
+        replies,
+        tlk,
+        set(),
+        state_effects,
+        [],
+        include_common_reply_effects=include_common_reply_effects,
+        common_effect_seen=common_effect_seen or set(),
+    )
+    return _possible_annotations(branches)
+
+
+def _automatic_route_possible_effect_paths(
+    entry_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    seen: set[int],
+    state_effects: StateEffectIndex,
+    path_effects: list[str],
+    *,
+    include_common_reply_effects: bool = True,
+    common_effect_seen: set[int],
+) -> list[list[str]]:
+    if entry_index in seen or not (0 <= entry_index < len(entries)):
+        return []
+
+    seen.add(entry_index)
+    entry = entries[entry_index]
+    entry_effects: list[str] = []
+    entry_effects.extend(_effect_lines(entry, state_effects))
+    entry_effects.extend(_state_transition_effect_lines(entry, state_effects))
+    entry_effects.extend(_cross_module_transition_effect_lines(entry, state_effects, path_effects + entry_effects))
+
+    hidden_links = _hidden_continue_links(entry, replies, tlk)
+    if not hidden_links:
+        effects = list(entry_effects)
+        if include_common_reply_effects and entry_index not in common_effect_seen:
+            effects.extend(
+                _common_reply_effects(
+                    entry,
+                    entries,
+                    replies,
+                    tlk,
+                    state_effects,
+                    common_effect_seen | {entry_index},
+                )
+            )
+        return [_merged_annotations(effects)]
+
+    branches: list[list[str]] = []
+    for link in hidden_links:
+        reply = _linked_reply(link, replies)
+        if reply is None:
+            continue
+
+        reply_effects = list(entry_effects)
+        reply_effects.extend(_effect_lines(reply, state_effects))
+        reply_effects.extend(_state_transition_effect_lines(reply, state_effects))
+        reply_effects.extend(
+            _cross_module_transition_effect_lines(reply, state_effects, path_effects + reply_effects)
+        )
+
+        next_links = [
+            next_link
+            for next_link in _ordered_entry_links(_as_list(reply.get("EntriesList")))
+            if not _link_detail_lines(next_link)
+        ]
+        if not next_links:
+            branches.append(_merged_annotations(reply_effects))
+            continue
+
+        for next_link in next_links:
+            next_index = _index_from_link(next_link)
+            if next_index is None:
+                continue
+            child_branches = _automatic_route_possible_effect_paths(
+                next_index,
+                entries,
+                replies,
+                tlk,
+                set(seen),
+                state_effects,
+                path_effects + reply_effects,
+                include_common_reply_effects=include_common_reply_effects,
+                common_effect_seen=common_effect_seen,
+            )
+            if child_branches:
+                branches.extend(_merged_annotations(reply_effects + child) for child in child_branches)
+            else:
+                branches.append(_merged_annotations(reply_effects))
+
+    if branches:
+        return branches
+    return [_merged_annotations(entry_effects)]
+
+
 def _automatic_route_effect_path(
     entry_index: int,
     entries: list[GffStruct],
@@ -1457,7 +1882,7 @@ def _automatic_route_effect_path(
     seen.add(entry_index)
     entry = entries[entry_index]
     entry_effects: list[str] = []
-    entry_effects.extend(_effect_lines(entry))
+    entry_effects.extend(_effect_lines(entry, state_effects))
     entry_effects.extend(_state_transition_effect_lines(entry, state_effects))
     entry_effects.extend(_cross_module_transition_effect_lines(entry, state_effects, path_effects + entry_effects))
 
@@ -1483,7 +1908,7 @@ def _automatic_route_effect_path(
         if reply is None:
             continue
         reply_effects = list(entry_effects)
-        reply_effects.extend(_effect_lines(reply))
+        reply_effects.extend(_effect_lines(reply, state_effects))
         reply_effects.extend(_state_transition_effect_lines(reply, state_effects))
         reply_effects.extend(
             _cross_module_transition_effect_lines(reply, state_effects, path_effects + reply_effects)
@@ -1491,7 +1916,7 @@ def _automatic_route_effect_path(
 
         next_links = [
             next_link
-            for next_link in _as_list(reply.get("EntriesList"))
+            for next_link in _ordered_entry_links(_as_list(reply.get("EntriesList")))
             if not _link_detail_lines(next_link)
         ]
         if not next_links:
@@ -1521,6 +1946,15 @@ def _automatic_route_effect_path(
     if len(branches) == 1:
         return branches[0]
     return _common_annotations(branches)
+
+
+def _possible_annotations(branches: list[list[str]]) -> list[str]:
+    annotations: list[str] = []
+    for branch in branches:
+        for annotation in _merged_annotations(branch):
+            if annotation not in annotations:
+                annotations.append(annotation)
+    return annotations
 
 
 def _common_annotations(branches: list[list[str]]) -> list[str]:
@@ -1577,7 +2011,7 @@ def _common_reply_effects(
         reply = _linked_reply(link, replies)
         if reply is None:
             continue
-        annotations = _effect_lines(reply)
+        annotations = _effect_lines(reply, state_effects)
         annotations.extend(
             _routed_entry_effect_lines(
                 reply,
@@ -1620,7 +2054,7 @@ def _single_unconditional_reply_next_entry(link: GffStruct, replies: list[GffStr
     reply = _linked_reply(link, replies)
     if reply is None:
         return None
-    next_links = _as_list(reply.get("EntriesList"))
+    next_links = _ordered_entry_links(_as_list(reply.get("EntriesList")))
     if len(next_links) != 1:
         return None
     next_link = next_links[0]
@@ -1678,7 +2112,7 @@ def _reply_check_lines(
     state_effects = state_effects or StateEffectIndex({}, {}, {})
     checks: list[tuple[dict[str, object], int]] = []
     fallback_entries: list[int] = []
-    for link in _as_list(reply.get("EntriesList")):
+    for link in _ordered_entry_links(_as_list(reply.get("EntriesList"))):
         entry_index = _index_from_link(link)
         has_condition = False
         for field, suffix in (("Active", ""), ("Active2", "b")):
@@ -1713,35 +2147,74 @@ def _reply_check_lines(
                 grouped_success_checks.append((check, [entry_index]))
         for check, entry_indices in grouped_success_checks:
             condition = _outcome_check_condition(check, reply_text)
+            lines.extend(_outcome_possible_effect_lines(entry_indices, condition, entries, replies, tlk, state_effects))
             lines.append(f"{condition}: {_common_entry_outcome(entry_indices, entries, replies, tlk, state_effects)}")
         if fallback_entries:
+            lines.extend(_outcome_possible_effect_lines(fallback_entries, "otherwise", entries, replies, tlk, state_effects))
             lines.append(f"otherwise: {_entry_outcomes(fallback_entries, entries, replies, tlk, state_effects)}")
         for check, entry_index in lt_checks:
             lines.append(f"DC {check['dc']}")
+            lines.extend(_outcome_possible_effect_lines([entry_index], "failure", entries, replies, tlk, state_effects))
             lines.append(f"failure: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
         for check, entry_index in other_checks:
             lines.append(_skill_check_label(check))
+            lines.extend(_outcome_possible_effect_lines([entry_index], "success", entries, replies, tlk, state_effects))
             lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
         return lines
 
     for check, entry_index in gt_checks:
         lines.append(_outcome_check_condition(check, reply_text))
+        lines.extend(_outcome_possible_effect_lines([entry_index], "success", entries, replies, tlk, state_effects))
         lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
         if fallback_entries:
+            lines.extend(_outcome_possible_effect_lines(fallback_entries, "failure", entries, replies, tlk, state_effects))
             lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, replies, tlk, state_effects)}")
 
     for check, entry_index in lt_checks:
         lines.append(_outcome_check_condition(check, reply_text))
         if fallback_entries:
+            lines.extend(_outcome_possible_effect_lines(fallback_entries, "success", entries, replies, tlk, state_effects))
             lines.append(f"success: {_entry_outcomes(fallback_entries, entries, replies, tlk, state_effects)}")
+        lines.extend(_outcome_possible_effect_lines([entry_index], "failure", entries, replies, tlk, state_effects))
         lines.append(f"failure: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
 
     for check, entry_index in other_checks:
         lines.append(_skill_check_label(check))
+        lines.extend(_outcome_possible_effect_lines([entry_index], "success", entries, replies, tlk, state_effects))
         lines.append(f"success: {_entry_outcome(entry_index, entries, replies, tlk, state_effects)}")
         if fallback_entries:
+            lines.extend(_outcome_possible_effect_lines(fallback_entries, "failure", entries, replies, tlk, state_effects))
             lines.append(f"failure: {_entry_outcomes(fallback_entries, entries, replies, tlk, state_effects)}")
     return lines
+
+
+def _outcome_possible_effect_lines(
+    indices: list[int],
+    outcome: str,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex,
+) -> list[str]:
+    common = _possible_annotations(
+        [
+            _automatic_route_effect_lines(index, entries, replies, tlk, state_effects)
+            for index in indices
+            if 0 <= index < len(entries)
+        ]
+    )
+    possible = _possible_annotations(
+        [
+            _automatic_route_possible_effect_lines(index, entries, replies, tlk, state_effects)
+            for index in indices
+            if 0 <= index < len(entries)
+        ]
+    )
+    return [
+        f"{effect} on {outcome}"
+        for effect in possible
+        if _is_effect_annotation(effect) and effect not in common
+    ]
 
 
 def _outcome_check_condition(check: dict[str, object], reply_text: str) -> str:
@@ -1867,11 +2340,15 @@ def _build_state_effect_index(
     scripts: list[ScriptResource],
     tlk: TlkTable,
 ) -> StateEffectIndex:
+    script_effects = _compiled_script_effect_index(scripts)
     script_analysis = _script_state_analyses(scripts)
-    empty_index = StateEffectIndex({}, {}, {})
+    empty_index = StateEffectIndex({}, {}, {}, script_effects_by_module=script_effects)
+    score_effects = _score_effect_index(parsed, tlk, empty_index)
+    empty_index.score_effects_by_global = score_effects
     effects_by_state: dict[tuple[str, int], list[str]] = {}
 
     for item in parsed:
+        empty_index.current_module = (item.resource.module_name or "").lower()
         entries = _as_list(item.root.get("EntryList"))
         replies = _as_list(item.root.get("ReplyList"))
         for start_link in _as_list(item.root.get("StartingList")):
@@ -1921,6 +2398,8 @@ def _build_state_effect_index(
         effects_by_state=effects_by_state,
         dynamic_global_sets=dynamic_global_sets,
         constant_global_sets=constant_global_sets,
+        script_effects_by_module=script_effects,
+        score_effects_by_global=score_effects,
     )
     _propagate_script_state_effects(effects_by_state, script_analysis)
     _refresh_start_state_effects(parsed, tlk, state_effects, script_analysis)
@@ -1947,6 +2426,8 @@ def _build_state_effect_index(
         effects_by_state=effects_by_state,
         dynamic_global_sets=dynamic_global_sets,
         constant_global_sets=constant_global_sets,
+        script_effects_by_module=script_effects,
+        score_effects_by_global=score_effects,
         contextual_script_effects=contextual_script_effects,
         cross_module_script_effects=cross_module_script_effects,
     )
@@ -1983,50 +2464,55 @@ def _refresh_start_state_effects(
     state_effects: StateEffectIndex,
     script_analysis: dict[str, NcsStateAnalysis],
 ) -> None:
-    for _pass in range(2):
-        changed = False
-        for item in parsed:
-            entries = _as_list(item.root.get("EntryList"))
-            replies = _as_list(item.root.get("ReplyList"))
-            for start_link in _as_list(item.root.get("StartingList")):
-                entry_index = _index_from_link(start_link)
-                if entry_index is None or not (0 <= entry_index < len(entries)):
-                    continue
+    previous_module = state_effects.current_module
+    try:
+        for _pass in range(2):
+            changed = False
+            for item in parsed:
+                state_effects.current_module = (item.resource.module_name or "").lower()
+                entries = _as_list(item.root.get("EntryList"))
+                replies = _as_list(item.root.get("ReplyList"))
+                for start_link in _as_list(item.root.get("StartingList")):
+                    entry_index = _index_from_link(start_link)
+                    if entry_index is None or not (0 <= entry_index < len(entries)):
+                        continue
 
-                effects = _automatic_route_effect_lines(
-                    entry_index,
-                    entries,
-                    replies,
-                    tlk,
-                    state_effects,
-                    include_common_reply_effects=False,
-                )
-                if not effects:
-                    continue
+                    effects = _automatic_route_effect_lines(
+                        entry_index,
+                        entries,
+                        replies,
+                        tlk,
+                        state_effects,
+                        include_common_reply_effects=False,
+                    )
+                    if not effects:
+                        continue
 
-                states = _condition_states_from_link(start_link, item.resource.module_name)
-                if not states:
-                    states = []
-                    for field, suffix in (("Active", ""), ("Active2", "b")):
-                        script = _script_key(_plain_text(start_link.get(field)))
-                        value = _condition_param(start_link, 1, suffix)
-                        if not script or value is None:
-                            continue
-                        analysis = script_analysis.get(script)
-                        if analysis is None:
-                            continue
-                        for state_name in analysis.global_reads:
-                            states.append((_state_key(state_name), value))
+                    states = _condition_states_from_link(start_link, item.resource.module_name)
+                    if not states:
+                        states = []
+                        for field, suffix in (("Active", ""), ("Active2", "b")):
+                            script = _script_key(_plain_text(start_link.get(field)))
+                            value = _condition_param(start_link, 1, suffix)
+                            if not script or value is None:
+                                continue
+                            analysis = script_analysis.get(script)
+                            if analysis is None:
+                                continue
+                            for state_name in analysis.global_reads:
+                                states.append((_state_key(state_name), value))
 
-                for state in states:
-                    before = len(state_effects.effects_by_state.setdefault(state, []))
-                    _extend_unique(state_effects.effects_by_state[state], effects)
-                    if len(state_effects.effects_by_state[state]) != before:
-                        changed = True
-        if changed:
-            _propagate_script_state_effects(state_effects.effects_by_state, script_analysis)
-        else:
-            break
+                    for state in states:
+                        before = len(state_effects.effects_by_state.setdefault(state, []))
+                        _extend_unique(state_effects.effects_by_state[state], effects)
+                        if len(state_effects.effects_by_state[state]) != before:
+                            changed = True
+            if changed:
+                _propagate_script_state_effects(state_effects.effects_by_state, script_analysis)
+            else:
+                break
+    finally:
+        state_effects.current_module = previous_module
 
 
 def _forced_terminal_start_transitions(
@@ -2035,16 +2521,21 @@ def _forced_terminal_start_transitions(
     state_effects: StateEffectIndex,
 ) -> list[tuple[str, str, int, list[str]]]:
     transitions: list[tuple[str, str, int, list[str]]] = []
-    for item in parsed:
-        entries = _as_list(item.root.get("EntryList"))
-        replies = _as_list(item.root.get("ReplyList"))
-        for start_link in _as_list(item.root.get("StartingList")):
-            entry_index = _index_from_link(start_link)
-            if entry_index is None:
-                continue
-            transitions.extend(
-                _forced_terminal_route_transitions(entry_index, entries, replies, tlk, state_effects)
-            )
+    previous_module = state_effects.current_module
+    try:
+        for item in parsed:
+            state_effects.current_module = (item.resource.module_name or "").lower()
+            entries = _as_list(item.root.get("EntryList"))
+            replies = _as_list(item.root.get("ReplyList"))
+            for start_link in _as_list(item.root.get("StartingList")):
+                entry_index = _index_from_link(start_link)
+                if entry_index is None:
+                    continue
+                transitions.extend(
+                    _forced_terminal_route_transitions(entry_index, entries, replies, tlk, state_effects)
+                )
+    finally:
+        state_effects.current_module = previous_module
     return transitions
 
 
@@ -2075,7 +2566,7 @@ def _forced_terminal_route_transitions(
             break
         transitions.extend(_state_transition_effect_details(reply, state_effects))
 
-        next_links = _as_list(reply.get("EntriesList"))
+        next_links = _ordered_entry_links(_as_list(reply.get("EntriesList")))
         if not next_links:
             break
         next_index = _index_from_link(next_links[0])
@@ -2084,6 +2575,137 @@ def _forced_terminal_route_transitions(
         current = next_index
 
     return transitions
+
+
+def _score_effect_index(
+    parsed: list[ParsedDialogue],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex,
+) -> dict[tuple[str, int], str]:
+    labels: dict[tuple[str, int], list[str]] = {}
+    previous_module = state_effects.current_module
+    try:
+        for item in parsed:
+            state_effects.current_module = (item.resource.module_name or "").lower()
+            entries = _as_list(item.root.get("EntryList"))
+            replies = _as_list(item.root.get("ReplyList"))
+            for reply in replies:
+                for link in _ordered_entry_links(_as_list(reply.get("EntriesList"))):
+                    score_condition = _score_condition_from_link(link)
+                    if score_condition is None:
+                        continue
+
+                    global_name, direction = score_condition
+                    entry_index = _index_from_link(link)
+                    if entry_index is None or not (0 <= entry_index < len(entries)):
+                        continue
+
+                    route_effects = _automatic_route_effect_lines(
+                        entry_index,
+                        entries,
+                        replies,
+                        tlk,
+                        state_effects,
+                        include_common_reply_effects=False,
+                    )
+                    for effect in route_effects:
+                        parsed_effect = _parse_effect_annotation(effect)
+                        if parsed_effect is None:
+                            continue
+                        label, _amount = parsed_effect
+                        if label not in {"Light Side", "Dark Side"}:
+                            continue
+                        _extend_unique(labels.setdefault((global_name, direction), []), [f"{label} track"])
+    finally:
+        state_effects.current_module = previous_module
+
+    return {
+        key: values[0] if len(values) == 1 else " / ".join(values)
+        for key, values in labels.items()
+    }
+
+
+def _score_condition_from_link(link: GffStruct) -> tuple[str, int] | None:
+    for field, str_field in (("Active", "ParamStrA"), ("Active2", "ParamStrB")):
+        script = _script_key(_plain_text(link.get(field)))
+        global_name = _plain_text(link.get(str_field))
+        if not global_name:
+            continue
+        if script == "c_global_gt":
+            return _global_number_state(global_name), 1
+        if script == "c_global_lt":
+            return _global_number_state(global_name), -1
+    return None
+
+
+def _compiled_script_effect_index(scripts: list[ScriptResource]) -> dict[tuple[str, str], list[str]]:
+    parsed_scripts: list[tuple[ScriptResource, list[tuple[int, int, tuple[object, ...]]]]] = []
+    for resource in scripts:
+        try:
+            instructions = _read_ncs_instructions(resource.data)
+        except ValueError:
+            continue
+        parsed_scripts.append((resource, _instruction_signature(instructions)))
+
+    alignment_signatures: list[tuple[tuple[tuple[int, int, tuple[object, ...]], ...], str]] = []
+    for resource, signature in parsed_scripts:
+        script = _script_key(resource.script_name)
+        effect = _known_alignment_effect(script)
+        if effect is None:
+            continue
+        body = _alignment_effect_body(signature)
+        if body is None:
+            continue
+        alignment_signatures.append((body, effect))
+
+    effects: dict[tuple[str, str], list[str]] = {}
+    for resource, signature in parsed_scripts:
+        script = _script_key(resource.script_name)
+        if not script or _known_alignment_effect(script) is not None:
+            continue
+
+        script_effects: list[str] = []
+        for body, effect in alignment_signatures:
+            if _contains_instruction_sequence(signature, body):
+                _extend_unique(script_effects, [effect])
+        if script_effects:
+            module = (resource.module_name or "").lower()
+            effects[(module, script)] = _merged_annotations(script_effects)
+    return effects
+
+
+def _known_alignment_effect(script: str) -> str | None:
+    normalized = _script_key(script)
+    if normalized not in ALIGNMENT_SCRIPT_EFFECTS:
+        return None
+    side, points = ALIGNMENT_SCRIPT_EFFECTS[normalized]
+    return f"{side} +{points}"
+
+
+def _instruction_signature(instructions: list[NcsInstruction]) -> list[tuple[int, int, tuple[object, ...]]]:
+    return [(instruction.opcode, instruction.qualifier, instruction.args) for instruction in instructions]
+
+
+def _alignment_effect_body(
+    instructions: list[tuple[int, int, tuple[object, ...]]],
+) -> tuple[tuple[int, int, tuple[object, ...]], ...] | None:
+    for index, instruction in enumerate(instructions):
+        if instruction[0] == 0x05 and instruction[2] == (125, 1) and index >= 8:
+            return tuple(instructions[index - 8 :])
+    return None
+
+
+def _contains_instruction_sequence(
+    haystack: list[tuple[int, int, tuple[object, ...]]],
+    needle: tuple[tuple[int, int, tuple[object, ...]], ...],
+) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    needle_length = len(needle)
+    for index in range(0, len(haystack) - needle_length + 1):
+        if tuple(haystack[index : index + needle_length]) == needle:
+            return True
+    return False
 
 
 def _script_state_analyses(scripts: list[ScriptResource]) -> dict[str, NcsStateAnalysis]:
@@ -2134,6 +2756,8 @@ def _analyze_ncs_state(data: bytes, module_name: str | None = None) -> NcsStateA
                 state = _global_boolean_state(global_name)
                 analysis.global_reads.add(state)
                 value = _following_equality_value(instructions, index)
+                if value is None:
+                    value = _following_boolean_branch_value(instructions, index)
                 if value is not None:
                     analysis.state_conditions.add((state, 1 if value else 0))
             continue
@@ -2144,6 +2768,8 @@ def _analyze_ncs_state(data: bytes, module_name: str | None = None) -> NcsStateA
                 state = _local_boolean_state(slot, module_name)
                 analysis.global_reads.add(state)
                 value = _following_equality_value(instructions, index)
+                if value is None:
+                    value = _following_boolean_branch_value(instructions, index)
                 if value is not None:
                     analysis.state_conditions.add((state, 1 if value else 0))
             continue
@@ -2341,6 +2967,16 @@ def _following_equality_value(instructions: list[NcsInstruction], index: int) ->
     return int(instructions[index + 1].args[0])
 
 
+def _following_boolean_branch_value(instructions: list[NcsInstruction], index: int) -> int | None:
+    if index + 1 >= len(instructions):
+        return None
+    if _is_jump_zero(instructions[index + 1]):
+        return 1
+    if _is_jump_nonzero(instructions[index + 1]):
+        return 0
+    return None
+
+
 def _previous_const_string(instructions: list[NcsInstruction], index: int) -> tuple[str, int | None]:
     previous = _previous_instruction(instructions, index)
     if previous is None or previous.opcode != 0x04 or previous.qualifier != 0x05:
@@ -2438,7 +3074,7 @@ def _state_transition_effect_details(
     state_effects: StateEffectIndex,
 ) -> list[tuple[str, str, int, list[str]]]:
     details: list[tuple[str, str, int, list[str]]] = []
-    for state_name, value in _direct_action_state_sets(node):
+    for state_name, value in _direct_action_state_sets(node, state_effects.current_module):
         effects = state_effects.effects_by_state.get((_state_key(state_name), value), [])
         if effects:
             details.append(("", state_name, value, _merged_annotations(effects)))
@@ -2531,7 +3167,7 @@ def _condition_state(
     return None
 
 
-def _direct_action_state_sets(node: GffStruct) -> list[tuple[str, int]]:
+def _direct_action_state_sets(node: GffStruct, module_name: str | None = None) -> list[tuple[str, int]]:
     states: list[tuple[str, int]] = []
     for script, suffix, str_field in (("Script", "", "ActionParamStrA"), ("Script2", "b", "ActionParamStrB")):
         script_name = _script_key(_plain_text(node.get(script)))
@@ -2546,11 +3182,11 @@ def _direct_action_state_sets(node: GffStruct) -> list[tuple[str, int]]:
         elif script_name == "a_glob_bool_set" and string_param:
             state = (_global_boolean_state(string_param), 1 if value else 0)
         elif script_name == "a_local_set" and value is not None:
-            state = (_local_boolean_state(value), 1)
+            state = (_local_boolean_state(value, module_name), 1)
         elif script_name == "a_local_reset" and value is not None:
-            state = (_local_boolean_state(value), 0)
+            state = (_local_boolean_state(value, module_name), 0)
         elif script_name == "a_localn_set" and value is not None and second_value is not None:
-            state = (_local_number_state(value), second_value)
+            state = (_local_number_state(value, module_name), second_value)
         if state is not None and state not in states:
             states.append(state)
     return states
@@ -2625,10 +3261,11 @@ def _contextual_script_effects(
     return effects
 
 
-def _effect_lines(node: GffStruct) -> list[str]:
+def _effect_lines(node: GffStruct, state_effects: StateEffectIndex | None = None) -> list[str]:
     effects: list[str] = []
+    effects.extend(_score_increment_effect_lines(node, state_effects))
     for script, params in _action_script_calls(node):
-        normalized = script.lower()
+        normalized = _script_key(script)
         amount = params[0] if params else 0
         if normalized in ALIGNMENT_SCRIPT_EFFECTS:
             side, points = ALIGNMENT_SCRIPT_EFFECTS[normalized]
@@ -2648,7 +3285,50 @@ def _effect_lines(node: GffStruct) -> list[str]:
                 influence_amount = abs(influence_amount or 1)
             if influence_amount:
                 effects.append(f"{companion} Influence {influence_amount:+d}")
+        _extend_unique(effects, _inferred_script_effect_lines(normalized, state_effects))
     return effects
+
+
+def _score_increment_effect_lines(node: GffStruct, state_effects: StateEffectIndex | None) -> list[str]:
+    if state_effects is None or not state_effects.score_effects_by_global:
+        return []
+
+    effects: list[str] = []
+    for script_field, suffix, str_field in (
+        ("Script", "", "ActionParamStrA"),
+        ("Script2", "b", "ActionParamStrB"),
+    ):
+        script = _script_key(_plain_text(node.get(script_field)))
+        if script != "a_global_inc":
+            continue
+
+        amount = _int_value(node.get(f"ActionParam1{suffix}")) or 0
+        if not amount:
+            continue
+
+        global_name = _plain_text(node.get(str_field))
+        if not global_name:
+            continue
+
+        direction = 1 if amount > 0 else -1
+        label = state_effects.score_effects_by_global.get((_global_number_state(global_name), direction))
+        if label:
+            effects.append(f"{label} +{abs(amount)}")
+    return effects
+
+
+def _inferred_script_effect_lines(script: str, state_effects: StateEffectIndex | None) -> list[str]:
+    if state_effects is None or not state_effects.script_effects_by_module:
+        return []
+
+    current_module = (state_effects.current_module or "").lower()
+    for module in (current_module, "override", "base"):
+        if not module:
+            continue
+        effects = state_effects.script_effects_by_module.get((module, script))
+        if effects:
+            return list(effects)
+    return []
 
 
 def _action_script_calls(node: GffStruct) -> list[tuple[str, list[int]]]:
@@ -2912,7 +3592,7 @@ def _force_persuade_choice_tag(link: GffStruct, reply: GffStruct | None) -> str:
         if level:
             levels.append(level)
     if reply is not None:
-        for entry_link in _as_list(reply.get("EntriesList")):
+        for entry_link in _ordered_entry_links(_as_list(reply.get("EntriesList"))):
             for field in ("Active", "Active2"):
                 level = _force_persuade_level(_plain_text(entry_link.get(field)))
                 if level:
@@ -2989,7 +3669,7 @@ def _condition_scripts(link: GffStruct | None, reply: GffStruct | None) -> list[
             if value:
                 scripts.append(value)
     if reply is not None:
-        for entry_link in _as_list(reply.get("EntriesList")):
+        for entry_link in _ordered_entry_links(_as_list(reply.get("EntriesList"))):
             for field in ("Active", "Active2"):
                 value = _plain_text(entry_link.get(field))
                 if value:
@@ -3148,7 +3828,7 @@ def _forced_terminal_entry_end(
     if _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects):
         return False
 
-    next_links = _as_list(reply.get("EntriesList"))
+    next_links = _ordered_entry_links(_as_list(reply.get("EntriesList")))
     if not next_links:
         return True
     if len(next_links) != 1:
@@ -3240,6 +3920,513 @@ def _build_speaker_name_index(resources: list[NameResource], tlk: TlkTable) -> S
                 _add_speaker_name(by_module, (module, key), name)
 
     return SpeakerNameIndex(names_by_module_key=by_module, names_by_key=by_key)
+
+
+def _build_cross_dialogue_preludes(
+    parsed: list[ParsedDialogue],
+    tlk: TlkTable,
+    speaker_names: SpeakerNameIndex | None,
+    state_effects: StateEffectIndex,
+    script_resources: list[ScriptResource],
+) -> dict[tuple[str, str, int], list[CrossDialoguePrelude]]:
+    by_module: dict[str, list[ParsedDialogue]] = {}
+    for item in parsed:
+        module = (item.resource.module_name or "").lower()
+        if module:
+            by_module.setdefault(module, []).append(item)
+
+    script_literals = _script_string_literal_index(script_resources)
+    preludes: dict[tuple[str, str, int], list[CrossDialoguePrelude]] = {}
+    previous_module = state_effects.current_module
+    try:
+        for module, items in by_module.items():
+            sources: list[tuple[ParsedDialogue, tuple[tuple[str, str], ...], list[str]]] = []
+            targets: list[tuple[ParsedDialogue, int, list[str]]] = []
+
+            for item in items:
+                state_effects.current_module = module
+                entries = _as_list(item.root.get("EntryList"))
+                replies = _as_list(item.root.get("ReplyList"))
+                _resolve_entry_speaker_labels(entries, item.resource, speaker_names)
+                speaker_hint = _conversation_speaker_hint(item.resource, item.root, speaker_names)
+
+                for entry_index in range(len(entries)):
+                    source = _cross_dialogue_prelude_source(
+                        entry_index,
+                        entries,
+                        replies,
+                        tlk,
+                        speaker_hint,
+                        state_effects,
+                    )
+                    if source is not None:
+                        sources.append((item, source[0], source[1]))
+
+                for start_index in _starting_entry_indices(item.root):
+                    module_handoff_sources = _cross_module_prelude_sources(
+                        start_index,
+                        entries,
+                        replies,
+                        tlk,
+                        speaker_hint,
+                        state_effects,
+                        module,
+                        script_literals,
+                        set(by_module),
+                    )
+                    for target_module, label, turns in module_handoff_sources:
+                        target_items = by_module.get(target_module, [])
+                        if len(target_items) != 1:
+                            continue
+                        target_item = target_items[0]
+                        for target_index in _starting_entry_indices(target_item.root):
+                            key = (target_module, target_item.resource.dlg_name.lower(), target_index)
+                            prelude = CrossDialoguePrelude(
+                                turns=turns,
+                                source_dlg_name=item.resource.dlg_name,
+                                label=label,
+                            )
+                            bucket = preludes.setdefault(key, [])
+                            if prelude not in bucket:
+                                bucket.append(prelude)
+
+                for entry_index in _starting_entry_indices(item.root):
+                    if 0 <= entry_index < len(entries):
+                        scripts = _cross_dialogue_target_scripts(entry_index, entries, replies, tlk)
+                        if scripts:
+                            targets.append((item, entry_index, scripts))
+
+            for source_item, turns, source_scripts in sources:
+                for target_item, target_index, target_scripts in targets:
+                    if source_item.resource.dlg_name.lower() == target_item.resource.dlg_name.lower():
+                        continue
+                    if not _handoff_scripts_match_any(source_scripts, target_scripts):
+                        continue
+
+                    key = (
+                        module,
+                        target_item.resource.dlg_name.lower(),
+                        target_index,
+                    )
+                    prelude = CrossDialoguePrelude(turns=turns, source_dlg_name=source_item.resource.dlg_name)
+                    bucket = preludes.setdefault(key, [])
+                    if prelude not in bucket:
+                        bucket.append(prelude)
+    finally:
+        state_effects.current_module = previous_module
+
+    return preludes
+
+
+def _cross_dialogue_prelude_source(
+    entry_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    speaker_hint: str,
+    state_effects: StateEffectIndex,
+) -> tuple[tuple[tuple[str, str], ...], list[str]] | None:
+    if not _is_forced_terminal_entry(entry_index, entries, replies, tlk, state_effects):
+        return None
+
+    chain = _forced_terminal_chain(entry_index, entries, replies, tlk, state_effects)
+    if not chain:
+        return None
+
+    turns = _forced_terminal_chain_turns(chain, entries, replies, tlk, speaker_hint, state_effects)
+    if not turns:
+        return None
+
+    scripts = _forced_terminal_chain_scripts(chain, entries, replies, tlk)
+    if not scripts:
+        return None
+
+    return tuple(turns), scripts
+
+
+def _cross_module_prelude_sources(
+    start_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    speaker_hint: str,
+    state_effects: StateEffectIndex,
+    source_module: str,
+    script_literals: dict[tuple[str, str], set[str]],
+    known_modules: set[str],
+) -> list[tuple[str, str, tuple[tuple[str, str], ...]]]:
+    paths = _terminal_transcript_paths_from(
+        start_index,
+        "",
+        [],
+        set(),
+        entries,
+        replies,
+        tlk,
+        state_effects,
+    )
+    if not paths:
+        return []
+
+    sources: list[tuple[str, str, tuple[tuple[str, str], ...]]] = []
+    for label, path in paths:
+        turns = _forced_terminal_chain_turns(path, entries, replies, tlk, speaker_hint, state_effects)
+        if not turns:
+            continue
+
+        scripts = _forced_terminal_chain_scripts(path, entries, replies, tlk, include_helper_scripts=True)
+        target_modules = _script_target_modules(scripts, source_module, script_literals, known_modules)
+        for target_module in target_modules:
+            sources.append((target_module, label, tuple(turns)))
+    return sources
+
+
+def _terminal_transcript_paths_from(
+    entry_index: int,
+    label: str,
+    path: list[int],
+    seen: set[int],
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex,
+) -> list[tuple[str, list[int]]]:
+    if entry_index in seen or not (0 <= entry_index < len(entries)):
+        return []
+
+    entry = entries[entry_index]
+    if _entry_has_meaningful_replies(entry, entries, replies, tlk):
+        return []
+
+    next_path = path + [entry_index]
+    links = _as_list(entry.get("RepliesList"))
+    if not links:
+        return [(label, next_path)]
+
+    results: list[tuple[str, list[int]]] = []
+    sibling_reply_scripts = {_plain_text(link.get("Active")).lower() for link in links}
+    for link in links:
+        if not _is_trivial_continue_reply(link, replies, tlk):
+            return []
+        reply = _linked_reply(link, replies)
+        if reply is None:
+            results.append((_condition_label_join(label, _auto_link_condition_label(link, sibling_reply_scripts)), next_path))
+            continue
+        reply_text, _reply_notes = _split_designer_notes(_resolve_text(reply, tlk))
+        if _visibility_check_lines(link, reply_text) or _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects):
+            return []
+
+        next_links = _ordered_entry_links(_as_list(reply.get("EntriesList")))
+        if not next_links:
+            results.append((_condition_label_join(label, _auto_link_condition_label(link, sibling_reply_scripts)), next_path))
+            continue
+
+        link_label = _auto_link_condition_label(link, links)
+        for next_link in next_links:
+            if _link_detail_lines(next_link):
+                continue
+            next_index = _index_from_link(next_link)
+            if next_index is None:
+                continue
+            next_label = _auto_link_condition_label(next_link, next_links)
+            results.extend(
+                _terminal_transcript_paths_from(
+                    next_index,
+                    _condition_label_join(label, link_label, next_label),
+                    next_path,
+                    seen | {entry_index},
+                    entries,
+                    replies,
+                    tlk,
+                    state_effects,
+                )
+            )
+
+    deduped: list[tuple[str, list[int]]] = []
+    seen_paths: set[tuple[str, tuple[int, ...]]] = set()
+    for branch_label, branch_path in results:
+        key = (branch_label, tuple(branch_path))
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        deduped.append((branch_label, branch_path))
+    return deduped
+
+
+def _forced_terminal_chain(
+    entry_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex,
+) -> list[int]:
+    chain: list[int] = []
+    seen: set[int] = set()
+    current = entry_index
+
+    while 0 <= current < len(entries) and current not in seen:
+        if not _forced_terminal_entry_end(current, entries, replies, tlk, state_effects, set()):
+            break
+
+        seen.add(current)
+        chain.append(current)
+        links = _as_list(entries[current].get("RepliesList"))
+        if len(links) != 1:
+            break
+
+        reply = _linked_reply(links[0], replies)
+        if reply is None:
+            break
+
+        next_links = _ordered_entry_links(_as_list(reply.get("EntriesList")))
+        if len(next_links) != 1:
+            break
+        next_link = next_links[0]
+        if _link_detail_lines(next_link) or _visibility_check_lines(next_link, ""):
+            break
+
+        next_index = _index_from_link(next_link)
+        if next_index is None:
+            break
+        current = next_index
+
+    return chain
+
+
+def _forced_terminal_chain_turns(
+    chain: list[int],
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    speaker_hint: str,
+    state_effects: StateEffectIndex,
+) -> list[tuple[str, str]]:
+    turns: list[tuple[str, str]] = []
+    for entry_index in chain:
+        _append_entry_turn(turns, entry_index, entries, replies, tlk, speaker_hint)
+        links = _as_list(entries[entry_index].get("RepliesList"))
+        if len(links) != 1:
+            continue
+
+        reply_line = _reply_line_text(
+            links[0],
+            entries,
+            replies,
+            tlk,
+            state_effects,
+            include_outcome_annotations=False,
+        )
+        if reply_line and reply_line.lower() != "[continue]":
+            turns.append(("Exile", reply_line))
+    return turns
+
+
+def _forced_terminal_chain_scripts(
+    chain: list[int],
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    *,
+    include_helper_scripts: bool = False,
+) -> list[str]:
+    scripts: list[str] = []
+    for entry_index in chain:
+        _extend_unique(scripts, _action_script_names(entries[entry_index], include_helpers=include_helper_scripts))
+        links = _as_list(entries[entry_index].get("RepliesList"))
+        if len(links) != 1:
+            continue
+        if _link_detail_lines(links[0]) or _visibility_check_lines(links[0], ""):
+            continue
+        reply = _linked_reply(links[0], replies)
+        if reply is not None:
+            _extend_unique(scripts, _action_script_names(reply, include_helpers=include_helper_scripts))
+    return scripts
+
+
+def _cross_dialogue_target_scripts(
+    entry_index: int,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+) -> list[str]:
+    scripts: list[str] = []
+    seen: set[int] = set()
+    current = entry_index
+    while 0 <= current < len(entries) and current not in seen:
+        seen.add(current)
+        entry = entries[current]
+        _extend_unique(scripts, _action_script_names(entry))
+
+        text, _notes = _split_designer_notes(_resolve_text(entry, tlk))
+        if text:
+            break
+
+        next_index = _trivial_continue_next(entry, replies, tlk)
+        if next_index is None:
+            break
+        current = next_index
+
+    return scripts
+
+
+def _action_script_names(node: GffStruct, *, include_helpers: bool = False) -> list[str]:
+    names = [_script_key(script) for script, _params in _action_script_calls(node) if _script_key(script)]
+    if include_helpers:
+        return names
+    return [name for name in names if _is_handoff_script_candidate(name)]
+
+
+def _is_handoff_script_candidate(script: str) -> bool:
+    if script in _HANDOFF_SCRIPT_DENYLIST:
+        return False
+    if not script.startswith("a_"):
+        return False
+    helper_tokens = (
+        "anim",
+        "ambient",
+        "camera",
+        "cam",
+        "face",
+        "fix",
+        "music",
+        "sound",
+    )
+    return not any(token in script for token in helper_tokens)
+
+
+def _starting_entry_indices(root: GffStruct) -> list[int]:
+    indices: list[int] = []
+    for start_link in _as_list(root.get("StartingList")):
+        entry_index = _index_from_link(start_link)
+        if entry_index is not None and entry_index not in indices:
+            indices.append(entry_index)
+    return indices
+
+
+def _handoff_scripts_match_any(source_scripts: list[str], target_scripts: list[str]) -> bool:
+    return any(_handoff_scripts_match(source, target) for source in source_scripts for target in target_scripts)
+
+
+def _handoff_scripts_match(source: str, target: str) -> bool:
+    if source == target:
+        return False
+    if not (source.startswith("a_") and target.startswith("a_")):
+        return False
+    if source in _HANDOFF_SCRIPT_DENYLIST or target in _HANDOFF_SCRIPT_DENYLIST:
+        return False
+    if _handoff_numeric_prefix(source) != _handoff_numeric_prefix(target):
+        return False
+    if _handoff_numeric_prefix(source) is None:
+        return False
+
+    source_stem = _handoff_script_stem(source)
+    target_stem = _handoff_script_stem(target)
+    if not source_stem or not target_stem:
+        return False
+
+    common = _longest_common_alpha_substring(source_stem, target_stem)
+    return len(common) >= 5 and common not in _HANDOFF_COMMON_SUBSTRING_DENYLIST
+
+
+_HANDOFF_SCRIPT_DENYLIST = {
+    "a_dojo_fight",
+    "a_global_set",
+    "a_glob_bool_set",
+    "a_global_inc",
+    "a_local_set",
+    "a_play_anim",
+    "a_run_script",
+    "a_start_scene",
+    "a_trans_black",
+}
+
+_HANDOFF_COMMON_SUBSTRING_DENYLIST = {
+    "action",
+    "camera",
+    "cutscene",
+    "dialog",
+    "dlg",
+    "fade",
+    "jump",
+    "scene",
+    "start",
+}
+
+
+def _handoff_script_stem(script: str) -> str:
+    stem = _script_key(script)
+    stem = re.sub(r"^a_", "", stem)
+    stem = re.sub(r"^\d+", "", stem)
+    return re.sub(r"[^a-z]+", "", stem)
+
+
+def _handoff_numeric_prefix(script: str) -> str | None:
+    match = re.match(r"^a_(\d+)", _script_key(script))
+    return match.group(1) if match else None
+
+
+def _longest_common_alpha_substring(left: str, right: str) -> str:
+    best = ""
+    previous = [0] * (len(right) + 1)
+    for left_index, left_char in enumerate(left, start=1):
+        current = [0] * (len(right) + 1)
+        for right_index, right_char in enumerate(right, start=1):
+            if left_char != right_char:
+                continue
+            current[right_index] = previous[right_index - 1] + 1
+            if current[right_index] > len(best):
+                best = left[left_index - current[right_index] : left_index]
+        previous = current
+    return best
+
+
+def _script_string_literal_index(scripts: list[ScriptResource]) -> dict[tuple[str, str], set[str]]:
+    literals: dict[tuple[str, str], set[str]] = {}
+    for resource in scripts:
+        script = _script_key(resource.script_name)
+        if not script:
+            continue
+        try:
+            instructions = _read_ncs_instructions(resource.data)
+        except ValueError:
+            continue
+        strings = {
+            value.strip()
+            for instruction in instructions
+            for value in instruction.args
+            if isinstance(value, str) and value.strip()
+        }
+        if strings:
+            literals.setdefault(((resource.module_name or "").lower(), script), set()).update(strings)
+    return literals
+
+
+def _script_target_modules(
+    scripts: list[str],
+    source_module: str,
+    script_literals: dict[tuple[str, str], set[str]],
+    known_modules: set[str],
+) -> list[str]:
+    targets: list[str] = []
+    for script in scripts:
+        for literal in _script_literals_for(script, source_module, script_literals):
+            module = literal.lower()
+            if module == source_module or module not in known_modules:
+                continue
+            if module not in targets:
+                targets.append(module)
+    return targets
+
+
+def _script_literals_for(
+    script: str,
+    source_module: str,
+    script_literals: dict[tuple[str, str], set[str]],
+) -> set[str]:
+    values: set[str] = set()
+    for module in (source_module, "override", "base"):
+        values.update(script_literals.get((module, script), set()))
+    return values
 
 
 def _resource_speaker_name(root: GffStruct, tlk: TlkTable) -> str:
