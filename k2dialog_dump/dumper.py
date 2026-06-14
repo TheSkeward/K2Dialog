@@ -200,6 +200,7 @@ def render_dialogue(
     if _is_low_value_dialogue(resource, entries, replies, tlk):
         return ""
     state_transition_preludes = _state_transition_preludes(resource, root, entries, replies, tlk)
+    suppressed_tail_entries = _automatic_tail_entries(entries, replies, tlk, state_effects)
 
     lines: list[str] = []
     title = f"{resource.module_name or 'Unknown'} / {resource.dlg_name}"
@@ -215,6 +216,8 @@ def render_dialogue(
     rendered_any = False
     for index, entry in enumerate(entries):
         if index in skip_entries:
+            continue
+        if index in suppressed_tail_entries:
             continue
         if _is_empty_transition_entry(entry, replies, tlk):
             continue
@@ -424,6 +427,142 @@ def render_dialogue(
     if not rendered_any:
         return ""
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _automatic_tail_entries(
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex,
+) -> set[int]:
+    successor_cache: dict[int, tuple[int, ...]] = {}
+    meaningful_reply_cache: dict[int, bool] = {}
+    forced_reply_next_cache: dict[int, int | None] = {}
+    reaches_choice_cache: dict[int, bool] = {}
+
+    def has_meaningful_replies(index: int) -> bool:
+        if index in meaningful_reply_cache:
+            return meaningful_reply_cache[index]
+        if not (0 <= index < len(entries)):
+            meaningful_reply_cache[index] = False
+            return False
+        result = _entry_has_meaningful_replies(entries[index], entries, replies, tlk)
+        meaningful_reply_cache[index] = result
+        return result
+
+    def automatic_successors(index: int) -> tuple[int, ...]:
+        if index in successor_cache:
+            return successor_cache[index]
+        if not (0 <= index < len(entries)):
+            successor_cache[index] = ()
+            return ()
+
+        entry = entries[index]
+        if has_meaningful_replies(index):
+            successor_cache[index] = ()
+            return ()
+
+        hidden_next = tuple(_auto_next_entries(entry, replies, tlk))
+        if hidden_next:
+            successor_cache[index] = hidden_next
+            return hidden_next
+
+        forced_next = forced_reply_next(index)
+        if forced_next is None:
+            successor_cache[index] = ()
+            return ()
+
+        successor_cache[index] = (forced_next,)
+        return (forced_next,)
+
+    def forced_reply_next(index: int) -> int | None:
+        if index in forced_reply_next_cache:
+            return forced_reply_next_cache[index]
+        if not (0 <= index < len(entries)):
+            forced_reply_next_cache[index] = None
+            return None
+
+        result = _single_forced_reply_next(entries[index], entries, replies, tlk, state_effects)
+        forced_reply_next_cache[index] = result
+        return result
+
+    def reaches_choice(index: int, visiting: set[int] | None = None) -> bool:
+        if not (0 <= index < len(entries)):
+            return False
+        if has_meaningful_replies(index):
+            return True
+        cached = reaches_choice_cache.get(index)
+        if cached is not None:
+            return cached
+
+        visiting = visiting or set()
+        if index in visiting:
+            reaches_choice_cache[index] = False
+            return False
+
+        next_visiting = visiting | {index}
+        result = any(reaches_choice(next_index, next_visiting) for next_index in automatic_successors(index))
+        reaches_choice_cache[index] = result
+        return result
+
+    suppressed: set[int] = set()
+
+    def suppress_descendants(index: int, visiting: set[int]) -> None:
+        if index in visiting or not (0 <= index < len(entries)):
+            return
+        if has_meaningful_replies(index):
+            return
+        if not reaches_choice(index):
+            return
+
+        suppressed.add(index)
+        next_visiting = visiting | {index}
+        for next_index in automatic_successors(index):
+            suppress_descendants(next_index, next_visiting)
+
+    for index in range(len(entries)):
+        if not reaches_choice(index):
+            continue
+        for next_index in automatic_successors(index):
+            suppress_descendants(next_index, {index})
+
+    return suppressed
+
+
+def _single_forced_reply_next(
+    entry: GffStruct,
+    entries: list[GffStruct],
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    state_effects: StateEffectIndex,
+) -> int | None:
+    links = [
+        link
+        for link in _as_list(entry.get("RepliesList"))
+        if not _is_trivial_continue_reply(link, replies, tlk)
+    ]
+    if len(links) != 1:
+        return None
+    link = links[0]
+    reply = _linked_reply(link, replies)
+    if reply is None:
+        return None
+
+    reply_text, _reply_notes = _split_designer_notes(_resolve_text(reply, tlk))
+    if _reply_check_lines(reply, reply_text, entries, replies, tlk, state_effects):
+        return None
+
+    next_links = _ordered_entry_links(_as_list(reply.get("EntriesList")))
+    if len(next_links) != 1:
+        return None
+    next_link = next_links[0]
+    if _link_detail_lines(next_link):
+        return None
+
+    next_index = _index_from_link(next_link)
+    if next_index is None:
+        return None
+    return next_index
 
 
 def _linear_continue_chain(
@@ -3770,7 +3909,7 @@ def _is_orphan_entry(
     replies: list[GffStruct],
     tlk: TlkTable,
 ) -> bool:
-    return not _reply_lines(entry, entries, replies, tlk)
+    return _displayable_reply_link_count(entry, replies, tlk, stop_at=1) == 0
 
 
 def _entry_has_meaningful_replies(
@@ -3779,7 +3918,26 @@ def _entry_has_meaningful_replies(
     replies: list[GffStruct],
     tlk: TlkTable,
 ) -> bool:
-    return len(_reply_lines(entry, entries, replies, tlk)) >= 2
+    return _displayable_reply_link_count(entry, replies, tlk, stop_at=2) >= 2
+
+
+def _displayable_reply_link_count(
+    entry: GffStruct,
+    replies: list[GffStruct],
+    tlk: TlkTable,
+    *,
+    stop_at: int | None = None,
+) -> int:
+    count = 0
+    for link in _as_list(entry.get("RepliesList")):
+        if _is_trivial_continue_reply(link, replies, tlk):
+            continue
+        if _index_from_link(link) is None:
+            continue
+        count += 1
+        if stop_at is not None and count >= stop_at:
+            return count
+    return count
 
 
 def _is_forced_terminal_entry(
